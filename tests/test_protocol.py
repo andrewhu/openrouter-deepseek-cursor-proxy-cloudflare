@@ -15,14 +15,16 @@ from __future__ import annotations
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-import threading
 import time
 import unittest
 from typing import Any
-from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from dataclasses import replace
+
 from deepseek_cursor_proxy.config import ProxyConfig
+from deepseek_cursor_proxy.trace import sha256_text
+from tests.support.fixtures import HttpServerFixture, TEST_API_KEY_HASH, post_json
 from deepseek_cursor_proxy.reasoning_store import ReasoningStore
 from deepseek_cursor_proxy.server import DeepSeekProxyHandler, DeepSeekProxyServer
 
@@ -107,16 +109,13 @@ class StrictFakeDeepSeek(BaseHTTPRequestHandler):
         for index, message in enumerate(messages):
             if not isinstance(message, dict) or message.get("role") != "assistant":
                 continue
-            if _is_tool_turn_assistant(messages, index) and not isinstance(
-                message.get("reasoning_content"), str
-            ):
+            if _is_tool_turn_assistant(messages, index) and not isinstance(message.get("reasoning_content"), str):
                 return self._send(
                     400,
                     {
                         "error": {
                             "message": (
-                                "The reasoning_content in the thinking mode "
-                                "must be passed back to the API."
+                                "The reasoning_content in the thinking mode " "must be passed back to the API."
                             ),
                             "type": "invalid_request_error",
                             "code": "invalid_request_error",
@@ -154,11 +153,7 @@ class StrictFakeDeepSeek(BaseHTTPRequestHandler):
                     reasoning=THINKING_2_1,
                 ),
             )
-        if (
-            last_tool != -1
-            and messages[last_tool].get("tool_call_id") == CALL_ID_1
-            and last_assistant < last_tool
-        ):
+        if last_tool != -1 and messages[last_tool].get("tool_call_id") == CALL_ID_1 and last_assistant < last_tool:
             return self._send(
                 200,
                 _completion(
@@ -189,14 +184,7 @@ class StrictFakeDeepSeek(BaseHTTPRequestHandler):
             )
         return self._send(
             400,
-            {
-                "error": {
-                    "message": (
-                        "test fake: unexpected shape: "
-                        f"roles={[m.get('role') for m in messages]}"
-                    )
-                }
-            },
+            {"error": {"message": ("test fake: unexpected shape: " f"roles={[m.get('role') for m in messages]}")}},
         )
 
     def _send(self, status: int, body: dict[str, Any]) -> None:
@@ -233,63 +221,26 @@ def _last_index(messages: list[dict[str, Any]], role: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-class _Fixture:
-    def __init__(self, server: ThreadingHTTPServer) -> None:
-        self.server = server
-        self.thread = threading.Thread(target=server.serve_forever, daemon=True)
-        self.thread.start()
-
-    @property
-    def url(self) -> str:
-        host, port = self.server.server_address
-        return f"http://{host}:{port}"
-
-    def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
-
-
-def _start_strict_upstream() -> _Fixture:
+def _start_strict_upstream() -> HttpServerFixture:
     StrictFakeDeepSeek.requests = []
     StrictFakeDeepSeek.auth_headers = []
-    return _Fixture(ThreadingHTTPServer(("127.0.0.1", 0), StrictFakeDeepSeek))
+    return HttpServerFixture(ThreadingHTTPServer(("127.0.0.1", 0), StrictFakeDeepSeek))
 
 
 def _start_proxy(
     upstream_url: str,
     store: ReasoningStore,
     **config_overrides: Any,
-) -> _Fixture:
+) -> HttpServerFixture:
     proxy = DeepSeekProxyServer(("127.0.0.1", 0), DeepSeekProxyHandler)
     proxy.config = ProxyConfig(
         upstream_base_url=upstream_url,
-        upstream_model="deepseek-v4-pro",
-        ngrok=False,
+        proxy_api_key_hash=TEST_API_KEY_HASH,
         verbose=False,
-        cors=False,
         **config_overrides,
     )
     proxy.reasoning_store = store
-    return _Fixture(proxy)
-
-
-def _post(
-    url: str,
-    payload: dict[str, Any],
-    authorization: str = "Bearer sk-test",
-) -> tuple[int, dict[str, Any]]:
-    request = Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={"Authorization": authorization, "Content-Type": "application/json"},
-    )
-    try:
-        with urlopen(request, timeout=10) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        return exc.code, json.loads(exc.read().decode("utf-8"))
+    return HttpServerFixture(proxy)
 
 
 def _drop_reasoning(message: dict[str, Any]) -> dict[str, Any]:
@@ -311,9 +262,7 @@ class _StrictUpstreamCase(unittest.TestCase):
     def setUp(self) -> None:
         self.upstream = _start_strict_upstream()
         self.store = ReasoningStore(":memory:")
-        self.proxy = _start_proxy(
-            self.upstream.url, self.store, **self.config_overrides
-        )
+        self.proxy = _start_proxy(self.upstream.url, self.store, **self.config_overrides)
 
     def tearDown(self) -> None:
         self.proxy.close()
@@ -327,13 +276,11 @@ class CanonicalLoopTests(_StrictUpstreamCase):
         patch every prior assistant message that participated in the tool
         chain so the strict upstream accepts each turn."""
         # Turn 1.1: bare user message.
-        status, response_1_1 = _post(
+        status, response_1_1 = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
-                "messages": [
-                    {"role": "user", "content": "What's the weather tomorrow?"}
-                ],
+                "messages": [{"role": "user", "content": "What's the weather tomorrow?"}],
                 "tools": TOOLS,
             },
         )
@@ -343,7 +290,7 @@ class CanonicalLoopTests(_StrictUpstreamCase):
         self.assertEqual(first["tool_calls"][0]["id"], CALL_ID_1)
 
         # Turn 1.2: append tool result; Cursor drops reasoning.
-        status, response_1_2 = _post(
+        status, response_1_2 = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
@@ -366,7 +313,7 @@ class CanonicalLoopTests(_StrictUpstreamCase):
         self.assertEqual(upstream_1_2[1]["reasoning_content"], THINKING_1_1)
 
         # Turn 1.3: both prior assistants need patching.
-        status, response_1_3 = _post(
+        status, response_1_3 = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
@@ -393,7 +340,7 @@ class CanonicalLoopTests(_StrictUpstreamCase):
 
         # Turn 2.1: brand new user turn; the prior final assistant also
         # needs patching since DeepSeek treats it as part of the tool turn.
-        status, response_2_1 = _post(
+        status, response_2_1 = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
@@ -423,21 +370,23 @@ class CanonicalLoopTests(_StrictUpstreamCase):
     def test_authorization_namespace_isolation(self) -> None:
         """A second user with the same conversation prefix must NOT see
         cached reasoning from the first user."""
+        user_a_hash = sha256_text("sk-USER-A")
+        user_b_hash = sha256_text("sk-USER-B")
+        self.proxy.server.config = replace(self.proxy.server.config, proxy_api_key_hash=user_a_hash)
         # Prime cache as user A.
-        _post(
+        post_json(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
-                "messages": [
-                    {"role": "user", "content": "What's the weather tomorrow?"}
-                ],
+                "messages": [{"role": "user", "content": "What's the weather tomorrow?"}],
                 "tools": TOOLS,
             },
             authorization="Bearer sk-USER-A",
         )
 
+        self.proxy.server.config = replace(self.proxy.server.config, proxy_api_key_hash=user_b_hash)
         # User B replays a tool history with the exact same shape.
-        status, _ = _post(
+        status, _ = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
@@ -467,79 +416,9 @@ class CanonicalLoopTests(_StrictUpstreamCase):
         self.assertEqual(status, 200)
         sent = StrictFakeDeepSeek.requests[-1]
         leaked = any(
-            m.get("role") == "assistant" and m.get("reasoning_content") == THINKING_1_1
-            for m in sent["messages"]
+            m.get("role") == "assistant" and m.get("reasoning_content") == THINKING_1_1 for m in sent["messages"]
         )
         self.assertFalse(leaked)
-
-
-class StrictRejectModeTests(_StrictUpstreamCase):
-    config_overrides = {"missing_reasoning_strategy": "reject"}
-
-    def test_returns_409_without_calling_upstream(self) -> None:
-        status, payload = _post(
-            f"{self.proxy.url}/v1/chat/completions",
-            {
-                "model": "deepseek-v4-pro",
-                "messages": [
-                    {"role": "user", "content": "go"},
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [
-                            {
-                                "id": CALL_ID_1,
-                                "type": "function",
-                                "function": {"name": "get_date", "arguments": "{}"},
-                            }
-                        ],
-                    },
-                    {
-                        "role": "tool",
-                        "tool_call_id": CALL_ID_1,
-                        "content": "2026-04-24",
-                    },
-                ],
-            },
-        )
-        self.assertEqual(status, 409, payload)
-        self.assertEqual(payload["error"]["missing_reasoning_messages"], 1)
-        self.assertEqual(StrictFakeDeepSeek.requests, [])
-
-
-class ThinkingDisabledTests(_StrictUpstreamCase):
-    config_overrides = {"thinking": "disabled"}
-
-    def test_disabled_does_not_inject_reasoning(self) -> None:
-        _post(
-            f"{self.proxy.url}/v1/chat/completions",
-            {
-                "model": "deepseek-v4-pro",
-                "messages": [
-                    {"role": "user", "content": "ping"},
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "reasoning_content": "Should be discarded by proxy.",
-                        "tool_calls": [
-                            {
-                                "id": CALL_ID_1,
-                                "type": "function",
-                                "function": {"name": "get_date", "arguments": "{}"},
-                            }
-                        ],
-                    },
-                    {
-                        "role": "tool",
-                        "tool_call_id": CALL_ID_1,
-                        "content": "2026-04-24",
-                    },
-                ],
-            },
-        )
-        sent = StrictFakeDeepSeek.requests[-1]
-        self.assertEqual(sent["thinking"], {"type": "disabled"})
-        self.assertNotIn("reasoning_content", sent["messages"][1])
 
 
 class RecoveryTests(_StrictUpstreamCase):
@@ -547,7 +426,7 @@ class RecoveryTests(_StrictUpstreamCase):
         """Stale tool history with no cached reasoning: proxy keeps only
         the latest user message + recovery system message and prefixes a
         user-facing notice into the response."""
-        status, response = _post(
+        status, response = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
@@ -576,12 +455,8 @@ class RecoveryTests(_StrictUpstreamCase):
         )
         self.assertEqual(status, 200, response)
         sent = StrictFakeDeepSeek.requests[-1]
-        self.assertEqual(
-            [m["role"] for m in sent["messages"]], ["system", "system", "user"]
-        )
-        self.assertEqual(
-            sent["messages"][-1]["content"], "Thanks. What about Saturday?"
-        )
+        self.assertEqual([m["role"] for m in sent["messages"]], ["system", "system", "user"])
+        self.assertEqual(sent["messages"][-1]["content"], "Thanks. What about Saturday?")
         self.assertIn(
             "[deepseek-cursor-proxy] Refreshed reasoning",
             response["choices"][0]["message"]["content"],
@@ -593,7 +468,7 @@ class RecoveryTests(_StrictUpstreamCase):
         boundary marker for the proxy but must not be replayed upstream as
         if DeepSeek had written it."""
         # Trigger initial recovery so the response carries the notice.
-        status, first = _post(
+        status, first = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
@@ -623,7 +498,7 @@ class RecoveryTests(_StrictUpstreamCase):
 
         # Cursor faithfully echoes the response (including the notice prefix).
         echoed = _drop_reasoning(first["choices"][0]["message"])
-        status, _ = _post(
+        status, _ = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
@@ -664,7 +539,7 @@ class RecoveryTests(_StrictUpstreamCase):
         so `missing_indexes` stays populated. The proxy must NOT 409 in
         that case — it must forward to upstream and relay whatever
         DeepSeek decides. 409 is reserved for `reject` mode."""
-        status, _ = _post(
+        status, _ = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
@@ -762,9 +637,7 @@ class _StreamingThenJsonHandler(BaseHTTPRequestHandler):
                         "object": "chat.completion.chunk",
                         "created": 1,
                         "model": "deepseek-v4-pro",
-                        "choices": [
-                            {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
-                        ],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                     },
                 )
             )
@@ -799,9 +672,7 @@ class _StreamingThenJsonHandler(BaseHTTPRequestHandler):
 class StreamingThenNonStreamingTests(unittest.TestCase):
     def setUp(self) -> None:
         _StreamingThenJsonHandler.requests = []
-        self.upstream = _Fixture(
-            ThreadingHTTPServer(("127.0.0.1", 0), _StreamingThenJsonHandler)
-        )
+        self.upstream = HttpServerFixture(ThreadingHTTPServer(("127.0.0.1", 0), _StreamingThenJsonHandler))
         self.store = ReasoningStore(":memory:")
         self.proxy = _start_proxy(self.upstream.url, self.store)
 
@@ -837,7 +708,7 @@ class StreamingThenNonStreamingTests(unittest.TestCase):
             self.assertIn("data: [DONE]", response.read().decode("utf-8"))
 
         # Non-streaming follow-up (Cursor strips reasoning_content).
-        status, payload = _post(
+        status, payload = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
@@ -941,9 +812,7 @@ class _ReasoningStreamHandler(BaseHTTPRequestHandler):
 
 class StreamingDisplayTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.upstream = _Fixture(
-            ThreadingHTTPServer(("127.0.0.1", 0), _ReasoningStreamHandler)
-        )
+        self.upstream = HttpServerFixture(ThreadingHTTPServer(("127.0.0.1", 0), _ReasoningStreamHandler))
         self.store = ReasoningStore(":memory:")
         self.proxy = _start_proxy(self.upstream.url, self.store)
 
@@ -971,11 +840,7 @@ class StreamingDisplayTests(unittest.TestCase):
         with urlopen(request, timeout=2) as response:
             body = response.read().decode("utf-8")
 
-        chunks = [
-            json.loads(line.removeprefix("data: "))
-            for line in body.splitlines()
-            if line.startswith("data: {")
-        ]
+        chunks = [json.loads(line.removeprefix("data: ")) for line in body.splitlines() if line.startswith("data: {")]
         self.assertEqual(
             chunks[0]["choices"][0]["delta"]["content"],
             "<details>\n<summary>Thinking</summary>\n\nNeed ",
@@ -992,13 +857,11 @@ class NonStreamingDisplayTests(_StrictUpstreamCase):
     ) -> None:
         """The README claims thinking tokens are displayed in Cursor; this
         must hold for non-streaming responses too, not only streaming ones."""
-        status, response = _post(
+        status, response = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             {
                 "model": "deepseek-v4-pro",
-                "messages": [
-                    {"role": "user", "content": "What's the weather tomorrow?"}
-                ],
+                "messages": [{"role": "user", "content": "What's the weather tomorrow?"}],
                 "tools": TOOLS,
             },
         )
@@ -1039,15 +902,9 @@ class _PerThreadFakeDeepSeek(BaseHTTPRequestHandler):
         for index, message in enumerate(payload.get("messages") or []):
             if message.get("role") != "assistant":
                 continue
-            if (
-                message.get("tool_calls")
-                and message.get("reasoning_content") != expected_tool
-            ):
+            if message.get("tool_calls") and message.get("reasoning_content") != expected_tool:
                 return self._send(400, {"error": {"missing_index": index}})
-            if (
-                message.get("content") == final_content
-                and message.get("reasoning_content") != expected_final
-            ):
+            if message.get("content") == final_content and message.get("reasoning_content") != expected_final:
                 return self._send(400, {"error": {"missing_index": index}})
 
         messages = payload.get("messages") or []
@@ -1110,9 +967,7 @@ class _PerThreadFakeDeepSeek(BaseHTTPRequestHandler):
 class ConcurrentThreadTests(unittest.TestCase):
     def setUp(self) -> None:
         _PerThreadFakeDeepSeek.requests = []
-        self.upstream = _Fixture(
-            ThreadingHTTPServer(("127.0.0.1", 0), _PerThreadFakeDeepSeek)
-        )
+        self.upstream = HttpServerFixture(ThreadingHTTPServer(("127.0.0.1", 0), _PerThreadFakeDeepSeek))
         self.store = ReasoningStore(":memory:")
         self.proxy = _start_proxy(self.upstream.url, self.store)
 
@@ -1157,16 +1012,16 @@ class ConcurrentThreadTests(unittest.TestCase):
                 "tools": tools,
             }
 
-        status, first_a = _post(f"{self.proxy.url}/v1/chat/completions", first("A"))
+        status, first_a = post_json(f"{self.proxy.url}/v1/chat/completions", first("A"))
         self.assertEqual(status, 200)
-        status, first_b = _post(f"{self.proxy.url}/v1/chat/completions", first("B"))
+        status, first_b = post_json(f"{self.proxy.url}/v1/chat/completions", first("B"))
         self.assertEqual(status, 200)
-        status, _ = _post(
+        status, _ = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             second("B", first_b["choices"][0]["message"]),
         )
         self.assertEqual(status, 200)
-        status, _ = _post(
+        status, _ = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             second("A", first_a["choices"][0]["message"]),
         )
@@ -1234,9 +1089,7 @@ class _SlowToolStreamHandler(BaseHTTPRequestHandler):
                     "object": "chat.completion.chunk",
                     "created": 1,
                     "model": "deepseek-v4-pro",
-                    "choices": [
-                        {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
-                    ],
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                 },
             ]
             for chunk in chunks:
@@ -1251,10 +1104,7 @@ class _SlowToolStreamHandler(BaseHTTPRequestHandler):
 
         # Non-streaming follow-up.
         messages = payload.get("messages") or []
-        if (
-            len(messages) >= 2
-            and messages[1].get("reasoning_content") == "Streamed tool reasoning."
-        ):
+        if len(messages) >= 2 and messages[1].get("reasoning_content") == "Streamed tool reasoning.":
             self._send(
                 200,
                 _completion(
@@ -1278,9 +1128,7 @@ class _SlowToolStreamHandler(BaseHTTPRequestHandler):
 
 class StreamingCacheTimingTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.upstream = _Fixture(
-            ThreadingHTTPServer(("127.0.0.1", 0), _SlowToolStreamHandler)
-        )
+        self.upstream = HttpServerFixture(ThreadingHTTPServer(("127.0.0.1", 0), _SlowToolStreamHandler))
         self.store = ReasoningStore(":memory:")
         self.proxy = _start_proxy(self.upstream.url, self.store)
 
@@ -1326,7 +1174,7 @@ class StreamingCacheTimingTests(unittest.TestCase):
                 if '"finish_reason":"tool_calls"' in line:
                     break
 
-            status, payload = _post(
+            status, payload = post_json(
                 f"{self.proxy.url}/v1/chat/completions",
                 {
                     "model": "deepseek-v4-pro",

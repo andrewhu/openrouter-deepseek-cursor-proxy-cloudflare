@@ -1,21 +1,30 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 import hashlib
 import json
 import re
 from typing import Any
 
-from .config import ProxyConfig
+from .config import (
+    CURSOR_MODEL_ID,
+    OPENROUTER_MODEL_ID,
+    OPENROUTER_PROVIDER_ONLY,
+    REASONING_EFFORT,
+    ProxyConfig,
+    is_openrouter_upstream,
+)
 from .logging import LOG
 from .reasoning_store import (
     ReasoningStore,
+    canonical_scope_message,
     conversation_scope,
+    conversation_scope_from_canonical,
     message_signature,
+    normalize_tool_call,
+    reasoning_lookup_key_specs,
     tool_call_ids,
-    tool_call_names,
-    tool_call_signature,
-    turn_context_signature,
 )
 from .streaming import fold_reasoning_into_content
 
@@ -71,14 +80,6 @@ ROLE_MESSAGE_FIELDS = {
     "tool": {"role", "content", "tool_call_id"},
 }
 
-EFFORT_ALIASES = {
-    "low": "high",
-    "medium": "high",
-    "high": "high",
-    "max": "max",
-    "xhigh": "max",
-}
-
 CURSOR_THINKING_BLOCK_RE = re.compile(
     r"""
     (?:
@@ -115,19 +116,11 @@ class PreparedRequest:
     recovery_notice: str | None = None
     record_response_scope: str | None = None
     record_response_messages: list[dict[str, Any]] = field(default_factory=list)
-    record_response_contexts: list[tuple[str, list[dict[str, Any]]]] = field(
-        default_factory=list
-    )
+    record_response_contexts: list[tuple[str, list[dict[str, Any]]]] = field(default_factory=list)
     reasoning_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     recovery_steps: list[dict[str, Any]] = field(default_factory=list)
     continued_recovery_boundary: bool = False
     retired_prefix_messages: int = 0
-
-
-def normalize_reasoning_effort(value: Any) -> str:
-    if not isinstance(value, str):
-        return "high"
-    return EFFORT_ALIASES.get(value.strip().lower(), "high")
 
 
 def extract_text_content(content: Any) -> str | None:
@@ -158,30 +151,6 @@ def extract_text_content(content: Any) -> str | None:
 
 def strip_cursor_thinking_blocks(content: str) -> str:
     return CURSOR_THINKING_BLOCK_RE.sub("", content).lstrip("\r\n")
-
-
-def normalize_tool_call(tool_call: Any) -> dict[str, Any]:
-    if not isinstance(tool_call, dict):
-        tool_call = {}
-    function = tool_call.get("function") or {}
-    if not isinstance(function, dict):
-        function = {}
-
-    arguments = function.get("arguments", "")
-    if not isinstance(arguments, str):
-        arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
-
-    normalized: dict[str, Any] = {
-        "id": str(tool_call.get("id") or ""),
-        "type": tool_call.get("type") or "function",
-        "function": {
-            "name": str(function.get("name") or ""),
-            "arguments": arguments,
-        },
-    }
-    if not normalized["id"]:
-        normalized.pop("id")
-    return normalized
 
 
 def normalize_tool(tool: Any) -> dict[str, Any]:
@@ -239,8 +208,8 @@ def normalize_message(
     store: ReasoningStore | None,
     prior_messages: list[dict[str, Any]],
     cache_namespace: str,
-    repair_reasoning: bool,
-    keep_reasoning: bool,
+    *,
+    precomputed_scope: str | None = None,
 ) -> tuple[dict[str, Any], bool, bool, dict[str, Any] | None]:
     if not isinstance(message, dict):
         message = {"role": "user", "content": str(message)}
@@ -259,223 +228,103 @@ def normalize_message(
         normalized["content"] = strip_cursor_thinking_blocks(normalized["content"])
 
     if normalized.get("tool_calls"):
-        normalized["tool_calls"] = [
-            normalize_tool_call(tool_call)
-            for tool_call in normalized.get("tool_calls") or []
-        ]
+        normalized["tool_calls"] = [normalize_tool_call(tool_call) for tool_call in normalized.get("tool_calls") or []]
 
     patched = False
     missing = False
     diagnostic: dict[str, Any] | None = None
     if normalized["role"] == "assistant":
-        if not keep_reasoning:
+        reasoning = normalized.get("reasoning_content")
+        if not isinstance(reasoning, str):
             normalized.pop("reasoning_content", None)
-        elif repair_reasoning:
-            reasoning = normalized.get("reasoning_content")
-            if not isinstance(reasoning, str):
-                normalized.pop("reasoning_content", None)
-                needs_reasoning = assistant_needs_reasoning_for_tool_context(
-                    normalized, prior_messages
+            needs_reasoning = assistant_needs_reasoning_for_tool_context(normalized, prior_messages)
+            lookup_scope = precomputed_scope or conversation_scope(prior_messages, cache_namespace)
+            lookup_keys = (
+                reasoning_lookup_key_specs(
+                    normalized,
+                    lookup_scope,
+                    cache_namespace,
+                    prior_messages,
                 )
-                lookup_scope = conversation_scope(prior_messages, cache_namespace)
-                lookup_keys = (
-                    reasoning_lookup_keys(
-                        normalized,
-                        lookup_scope,
-                        cache_namespace,
-                        prior_messages,
-                    )
-                    if needs_reasoning
-                    else []
-                )
-                hit_kind = None
-                if needs_reasoning and store is not None:
-                    for lookup_key in lookup_keys:
-                        restored = store.get(str(lookup_key["key"]))
-                        if restored is not None:
-                            lookup_key["hit"] = True
-                            hit_kind = lookup_key["kind"]
-                            normalized["reasoning_content"] = restored
-                            patched = True
-                            if not lookup_key.get("portable"):
-                                store.backfill_portable_aliases(
-                                    normalized,
-                                    restored,
-                                    cache_namespace,
-                                    prior_messages,
-                                )
-                            break
-                if needs_reasoning and not patched:
-                    missing = True
-                if needs_reasoning:
-                    diagnostic = {
-                        "message_index": len(prior_messages),
-                        "role": "assistant",
-                        "needs_reasoning": True,
-                        "had_reasoning_content": False,
-                        "patched": patched,
-                        "missing": missing,
-                        "lookup_scope": lookup_scope,
-                        "message_signature": message_signature(normalized),
-                        "tool_call_ids": tool_call_ids(normalized),
-                        "lookup_keys": lookup_keys,
-                        "hit_kind": hit_kind,
-                    }
-            elif assistant_needs_reasoning_for_tool_context(normalized, prior_messages):
+                if needs_reasoning
+                else []
+            )
+            hit_kind = None
+            if needs_reasoning and store is not None:
+                for lookup_key in lookup_keys:
+                    restored = store.get(str(lookup_key["key"]))
+                    if restored is not None:
+                        lookup_key["hit"] = True
+                        hit_kind = lookup_key["kind"]
+                        normalized["reasoning_content"] = restored
+                        patched = True
+                        if not lookup_key.get("portable"):
+                            store.backfill_portable_aliases(
+                                normalized,
+                                restored,
+                                cache_namespace,
+                                prior_messages,
+                            )
+                        break
+            if needs_reasoning and not patched:
+                missing = True
+            if needs_reasoning:
                 diagnostic = {
                     "message_index": len(prior_messages),
                     "role": "assistant",
                     "needs_reasoning": True,
-                    "had_reasoning_content": True,
-                    "patched": False,
-                    "missing": False,
-                    "lookup_scope": conversation_scope(prior_messages, cache_namespace),
+                    "had_reasoning_content": False,
+                    "patched": patched,
+                    "missing": missing,
+                    "lookup_scope": lookup_scope,
                     "message_signature": message_signature(normalized),
                     "tool_call_ids": tool_call_ids(normalized),
-                    "lookup_keys": [],
-                    "hit_kind": "request",
+                    "lookup_keys": lookup_keys,
+                    "hit_kind": hit_kind,
                 }
+        elif assistant_needs_reasoning_for_tool_context(normalized, prior_messages):
+            diagnostic = {
+                "message_index": len(prior_messages),
+                "role": "assistant",
+                "needs_reasoning": True,
+                "had_reasoning_content": True,
+                "patched": False,
+                "missing": False,
+                "lookup_scope": precomputed_scope or conversation_scope(prior_messages, cache_namespace),
+                "message_signature": message_signature(normalized),
+                "tool_call_ids": tool_call_ids(normalized),
+                "lookup_keys": [],
+                "hit_kind": "request",
+            }
 
     allowed_fields = ROLE_MESSAGE_FIELDS.get(str(normalized["role"]), MESSAGE_FIELDS)
-    normalized = {
-        key: value for key, value in normalized.items() if key in allowed_fields
-    }
+    normalized = {key: value for key, value in normalized.items() if key in allowed_fields}
     return normalized, patched, missing, diagnostic
-
-
-def reasoning_lookup_keys(
-    message: dict[str, Any],
-    scope: str,
-    cache_namespace: str = "",
-    prior_messages: list[dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    keys = [
-        {
-            "kind": "message_signature",
-            "key": f"scope:{scope}:signature:{message_signature(message)}",
-            "portable": False,
-            "hit": False,
-        }
-    ]
-    keys.extend(
-        {
-            "kind": "tool_call_id",
-            "tool_call_id": tool_call_id,
-            "key": f"scope:{scope}:tool_call:{tool_call_id}",
-            "portable": False,
-            "hit": False,
-        }
-        for tool_call_id in tool_call_ids(message)
-    )
-    keys.extend(
-        {
-            "kind": "tool_call_signature",
-            "function_name": str((tool_call.get("function") or {}).get("name") or ""),
-            "key": (
-                f"scope:{scope}:tool_call_signature:"
-                f"{tool_call_signature(tool_call)}"
-            ),
-            "portable": False,
-            "hit": False,
-        }
-        for tool_call in (message.get("tool_calls") or [])
-        if isinstance(tool_call, dict)
-    )
-    keys.extend(
-        {
-            "kind": "tool_name",
-            "function_name": tool_name,
-            "key": f"scope:{scope}:tool_name:{tool_name}",
-            "portable": False,
-            "hit": False,
-        }
-        for tool_name in tool_call_names(message)
-    )
-    if cache_namespace and prior_messages is not None:
-        turn_signature = turn_context_signature(prior_messages)
-        keys.append(
-            {
-                "kind": "portable_message_signature",
-                "key": (
-                    f"namespace:{cache_namespace}:turn:{turn_signature}:"
-                    f"signature:{message_signature(message)}"
-                ),
-                "turn_context_signature": turn_signature,
-                "portable": True,
-                "hit": False,
-            }
-        )
-        keys.extend(
-            {
-                "kind": "portable_tool_call_id",
-                "tool_call_id": tool_call_id,
-                "key": (
-                    f"namespace:{cache_namespace}:turn:{turn_signature}:"
-                    f"tool_call:{tool_call_id}"
-                ),
-                "turn_context_signature": turn_signature,
-                "portable": True,
-                "hit": False,
-            }
-            for tool_call_id in tool_call_ids(message)
-        )
-        keys.extend(
-            {
-                "kind": "portable_tool_call_signature",
-                "function_name": str(
-                    (tool_call.get("function") or {}).get("name") or ""
-                ),
-                "key": (
-                    f"namespace:{cache_namespace}:turn:{turn_signature}:"
-                    f"tool_call_signature:{tool_call_signature(tool_call)}"
-                ),
-                "turn_context_signature": turn_signature,
-                "portable": True,
-                "hit": False,
-            }
-            for tool_call in (message.get("tool_calls") or [])
-            if isinstance(tool_call, dict)
-        )
-        keys.extend(
-            {
-                "kind": "portable_tool_name",
-                "function_name": tool_name,
-                "key": (
-                    f"namespace:{cache_namespace}:turn:{turn_signature}:"
-                    f"tool_name:{tool_name}"
-                ),
-                "turn_context_signature": turn_signature,
-                "portable": True,
-                "hit": False,
-            }
-            for tool_name in tool_call_names(message)
-        )
-    return keys
 
 
 def normalize_messages(
     messages: Any,
     store: ReasoningStore | None,
     cache_namespace: str,
-    repair_reasoning: bool,
-    keep_reasoning: bool,
 ) -> tuple[list[dict[str, Any]], int, list[int], list[dict[str, Any]]]:
     if not isinstance(messages, list):
         return [], 0, [], []
     normalized_messages: list[dict[str, Any]] = []
+    scope_messages: list[dict[str, Any]] = []
     patched_count = 0
     missing_indexes: list[int] = []
     diagnostics: list[dict[str, Any]] = []
     for message in messages:
+        lookup_scope = conversation_scope_from_canonical(scope_messages, cache_namespace)
         normalized, patched, missing, diagnostic = normalize_message(
             message,
             store,
             normalized_messages,
             cache_namespace,
-            repair_reasoning,
-            keep_reasoning,
+            precomputed_scope=lookup_scope,
         )
         normalized_messages.append(normalized)
+        scope_messages.append(canonical_scope_message(normalized))
         if patched:
             patched_count += 1
         if missing:
@@ -487,11 +336,7 @@ def normalize_messages(
 
 def has_recovery_notice(message: dict[str, Any]) -> bool:
     content = message.get("content")
-    return (
-        message.get("role") == "assistant"
-        and isinstance(content, str)
-        and content.startswith(RECOVERY_NOTICE_TEXT)
-    )
+    return message.get("role") == "assistant" and isinstance(content, str) and content.startswith(RECOVERY_NOTICE_TEXT)
 
 
 def strip_recovery_notice_for_upstream(
@@ -531,22 +376,14 @@ def active_messages_from_recovery_boundary(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], int, dict[str, Any]] | None:
     recovery_boundary_index = next(
-        (
-            index
-            for index in range(len(messages) - 1, -1, -1)
-            if has_recovery_notice(messages[index])
-        ),
+        (index for index in range(len(messages) - 1, -1, -1) if has_recovery_notice(messages[index])),
         -1,
     )
     if recovery_boundary_index == -1:
         return None
 
     context_user_index = next(
-        (
-            index
-            for index in range(recovery_boundary_index - 1, -1, -1)
-            if messages[index].get("role") == "user"
-        ),
+        (index for index in range(recovery_boundary_index - 1, -1, -1) if messages[index].get("role") == "user"),
         -1,
     )
     leading_messages = leading_system_messages(messages)
@@ -560,9 +397,7 @@ def active_messages_from_recovery_boundary(
         *recovered_tail,
     ]
     kept_context_messages = 1 if context_user_index != -1 else 0
-    retired_messages = (
-        recovery_boundary_index - len(leading_messages) - kept_context_messages
-    )
+    retired_messages = recovery_boundary_index - len(leading_messages) - kept_context_messages
     retired_messages = max(retired_messages, 0)
     step = {
         "strategy": "continued_recovery_boundary",
@@ -581,18 +416,13 @@ def recover_messages_from_missing_reasoning(
         (
             index
             for index in range(len(messages) - 1, -1, -1)
-            if has_recovery_notice(messages[index])
-            and any(missing_index < index for missing_index in missing_indexes)
+            if has_recovery_notice(messages[index]) and any(missing_index < index for missing_index in missing_indexes)
         ),
         -1,
     )
     if recovery_boundary_index != -1:
         context_user_index = next(
-            (
-                index
-                for index in range(recovery_boundary_index - 1, -1, -1)
-                if messages[index].get("role") == "user"
-            ),
+            (index for index in range(recovery_boundary_index - 1, -1, -1) if messages[index].get("role") == "user"),
             -1,
         )
         leading_messages = leading_system_messages(messages)
@@ -606,9 +436,7 @@ def recover_messages_from_missing_reasoning(
             *recovered_tail,
         ]
         kept_context_messages = 1 if context_user_index != -1 else 0
-        omitted_messages = (
-            recovery_boundary_index - len(leading_messages) - kept_context_messages
-        )
+        omitted_messages = recovery_boundary_index - len(leading_messages) - kept_context_messages
         return (
             recovered,
             omitted_messages,
@@ -624,11 +452,7 @@ def recover_messages_from_missing_reasoning(
         )
 
     last_user_index = next(
-        (
-            index
-            for index in range(len(messages) - 1, -1, -1)
-            if messages[index].get("role") == "user"
-        ),
+        (index for index in range(len(messages) - 1, -1, -1) if messages[index].get("role") == "user"),
         -1,
     )
     if last_user_index == -1:
@@ -678,43 +502,55 @@ def assistant_needs_reasoning_for_tool_context(
     return False
 
 
-def upstream_model_for(original_model: str, config: ProxyConfig) -> str:
-    if original_model.startswith("deepseek-"):
-        return original_model
-    LOG.warning(
-        "rewriting non-DeepSeek model %r to configured fallback %r",
-        original_model,
-        config.upstream_model,
-    )
-    return config.upstream_model
+def upstream_model_for(original_model: str) -> str:
+    if original_model not in {CURSOR_MODEL_ID, OPENROUTER_MODEL_ID}:
+        LOG.warning(
+            "rewriting model %r to %r",
+            original_model,
+            OPENROUTER_MODEL_ID,
+        )
+    return OPENROUTER_MODEL_ID
+
+
+def cursor_model_for(original_model: str) -> str:
+    return CURSOR_MODEL_ID
 
 
 def reasoning_model_family(upstream_model: str) -> str:
-    if upstream_model in {"deepseek-v4-pro", "deepseek-v4-flash"}:
+    if upstream_model in {
+        CURSOR_MODEL_ID,
+        OPENROUTER_MODEL_ID,
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+    }:
         return "deepseek-v4"
     return upstream_model
+
+
+def openrouter_provider_routing() -> dict[str, Any]:
+    return {
+        "only": list(OPENROUTER_PROVIDER_ONLY),
+        "allow_fallbacks": False,
+    }
 
 
 def reasoning_cache_namespace(
     config: ProxyConfig,
     upstream_model: str,
-    thinking: Any,
-    reasoning_effort: Any,
     authorization: str | None = None,
 ) -> str:
     auth_hash = ""
     if authorization:
         auth_hash = hashlib.sha256(authorization.encode("utf-8")).hexdigest()
-    payload = {
+    payload: dict[str, Any] = {
         "base_url": config.upstream_base_url,
         "model": reasoning_model_family(upstream_model),
-        "thinking": thinking,
-        "reasoning_effort": reasoning_effort,
+        "thinking_enabled": True,
+        "reasoning_effort": REASONING_EFFORT,
+        "provider_only": OPENROUTER_PROVIDER_ONLY,
         "authorization_hash": auth_hash,
     }
-    canonical = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -734,28 +570,43 @@ def response_recording_contexts(
     return contexts
 
 
+def normalize_upstream_reasoning_fields(payload: dict[str, Any]) -> None:
+    """Map OpenRouter `reasoning` to `reasoning_content` for Cursor and the cache."""
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            message = delta
+        reasoning = message.get("reasoning")
+        if isinstance(reasoning, str) and reasoning:
+            if not isinstance(message.get("reasoning_content"), str):
+                message["reasoning_content"] = reasoning
+
+
 def prepare_upstream_request(
     payload: dict[str, Any],
     config: ProxyConfig,
     store: ReasoningStore | None,
     authorization: str | None = None,
 ) -> PreparedRequest:
-    original_model = str(payload.get("model") or config.upstream_model)
-    upstream_model = upstream_model_for(original_model, config)
+    original_model = cursor_model_for(str(payload.get("model") or CURSOR_MODEL_ID))
+    upstream_model = upstream_model_for(str(payload.get("model") or CURSOR_MODEL_ID))
 
-    prepared = {
-        key: value for key, value in payload.items() if key in SUPPORTED_REQUEST_FIELDS
-    }
+    prepared = {key: value for key, value in payload.items() if key in SUPPORTED_REQUEST_FIELDS}
     dropped_fields = sorted(
         key
         for key in payload.keys()
-        if key not in SUPPORTED_REQUEST_FIELDS
-        and key not in {"max_completion_tokens", "functions", "function_call"}
+        if key not in SUPPORTED_REQUEST_FIELDS and key not in {"max_completion_tokens", "functions", "function_call"}
     )
     if dropped_fields:
-        LOG.warning(
-            "dropping unsupported request field(s): %s", ", ".join(dropped_fields)
-        )
+        LOG.warning("dropping unsupported request field(s): %s", ", ".join(dropped_fields))
     if "max_tokens" not in prepared and "max_completion_tokens" in payload:
         prepared["max_tokens"] = payload["max_completion_tokens"]
 
@@ -772,9 +623,7 @@ def prepare_upstream_request(
     if "tools" in prepared and isinstance(prepared["tools"], list):
         prepared["tools"] = [normalize_tool(tool) for tool in prepared["tools"]]
     elif isinstance(payload.get("functions"), list):
-        prepared["tools"] = [
-            legacy_function_to_tool(function) for function in payload["functions"]
-        ]
+        prepared["tools"] = [legacy_function_to_tool(function) for function in payload["functions"]]
 
     if "tool_choice" in prepared:
         tool_choice = normalize_tool_choice(prepared["tool_choice"])
@@ -787,58 +636,46 @@ def prepare_upstream_request(
         if tool_choice is not None:
             prepared["tool_choice"] = tool_choice
 
-    prepared["thinking"] = {"type": config.thinking}
-    thinking_enabled = config.thinking == "enabled"
-    thinking_disabled = config.thinking == "disabled"
-    if thinking_enabled:
-        prepared["reasoning_effort"] = normalize_reasoning_effort(
-            config.reasoning_effort
-        )
+    prepared.pop("thinking", None)
+    prepared.pop("reasoning_effort", None)
+    if is_openrouter_upstream(config.upstream_base_url):
+        prepared["provider"] = openrouter_provider_routing()
+        prepared["reasoning"] = {"effort": REASONING_EFFORT}
 
     cache_namespace = reasoning_cache_namespace(
         config,
         upstream_model,
-        prepared.get("thinking"),
-        prepared.get("reasoning_effort"),
         authorization,
     )
-    pre_repair_messages, _, _, _ = normalize_messages(
-        payload.get("messages"),
-        None,
-        cache_namespace,
-        repair_reasoning=False,
-        keep_reasoning=not thinking_disabled,
-    )
-    record_response_messages = pre_repair_messages
-    record_response_scope = conversation_scope(
-        record_response_messages, cache_namespace
-    )
-    messages_for_repair = pre_repair_messages
+    raw_messages = payload.get("messages")
+    if isinstance(raw_messages, list):
+        record_response_messages = copy.deepcopy(raw_messages)
+    else:
+        record_response_messages = []
+    record_response_scope = conversation_scope(record_response_messages, cache_namespace)
+    messages_for_repair = raw_messages
     continued_recovery_boundary = False
     retired_prefix_messages = 0
+    boundary = active_messages_from_recovery_boundary(record_response_messages)
+    if boundary is not None:
+        messages_for_repair, retired_prefix_messages, boundary_step = boundary
+        continued_recovery_boundary = True
+        recovery_steps: list[dict[str, Any]] = [boundary_step]
+    else:
+        recovery_steps = []
+    messages, patched_count, missing_indexes, reasoning_diagnostics = normalize_messages(
+        messages_for_repair,
+        store,
+        cache_namespace,
+    )
     recovered_count = 0
     recovery_dropped_messages = 0
     recovery_notice = None
-    recovery_steps: list[dict[str, Any]] = []
-    if thinking_enabled and config.missing_reasoning_strategy == "recover":
-        boundary = active_messages_from_recovery_boundary(pre_repair_messages)
-        if boundary is not None:
-            messages_for_repair, retired_prefix_messages, boundary_step = boundary
-            continued_recovery_boundary = True
-            recovery_steps.append(boundary_step)
-
-    messages, patched_count, missing_indexes, reasoning_diagnostics = (
-        normalize_messages(
-            messages_for_repair,
-            store,
-            cache_namespace,
-            repair_reasoning=thinking_enabled,
-            keep_reasoning=not thinking_disabled,
-        )
-    )
-    while missing_indexes and config.missing_reasoning_strategy == "recover":
-        recovered_messages, dropped_messages, notice, recovery_step = (
-            recover_messages_from_missing_reasoning(messages, missing_indexes)
+    while missing_indexes:
+        # Recovery drops at least one message per pass; if it cannot shrink the
+        # history, stop instead of retrying the same missing set.
+        recovered_messages, dropped_messages, notice, recovery_step = recover_messages_from_missing_reasoning(
+            messages, missing_indexes
         )
         recovery_steps.append(recovery_step)
         if not dropped_messages:
@@ -856,8 +693,6 @@ def prepare_upstream_request(
             recovered_messages,
             store,
             cache_namespace,
-            repair_reasoning=thinking_enabled,
-            keep_reasoning=not thinking_disabled,
         )
         reasoning_diagnostics.extend(latest_diagnostics)
     active_record_response_scope = conversation_scope(messages, cache_namespace)
@@ -903,14 +738,8 @@ def record_response_reasoning(
     if not isinstance(choices, list):
         return stored
     if recording_contexts is None:
-        response_scope = (
-            scope
-            if scope is not None
-            else conversation_scope(request_messages, cache_namespace)
-        )
-        response_prior_messages = (
-            prior_messages if prior_messages is not None else request_messages
-        )
+        response_scope = scope if scope is not None else conversation_scope(request_messages, cache_namespace)
+        response_prior_messages = prior_messages if prior_messages is not None else request_messages
         recording_contexts = [(response_scope, response_prior_messages)]
     for choice in choices:
         if not isinstance(choice, dict):
@@ -937,11 +766,10 @@ def rewrite_response_body(
     scope: str | None = None,
     prior_messages: list[dict[str, Any]] | None = None,
     recording_contexts: list[tuple[str, list[dict[str, Any]]]] | None = None,
-    display_reasoning: bool = False,
-    collapsible_reasoning: bool = True,
 ) -> bytes:
     response_payload = json.loads(body.decode("utf-8"))
     if isinstance(response_payload, dict):
+        normalize_upstream_reasoning_fields(response_payload)
         if content_prefix:
             prefix_response_content(response_payload, content_prefix)
         record_response_reasoning(
@@ -953,13 +781,10 @@ def rewrite_response_body(
             prior_messages=prior_messages,
             recording_contexts=recording_contexts,
         )
-        if display_reasoning:
-            fold_reasoning_into_content(response_payload, collapsible_reasoning)
+        fold_reasoning_into_content(response_payload, collapsible=True)
         if "model" in response_payload:
             response_payload["model"] = original_model
-    return json.dumps(
-        response_payload, ensure_ascii=False, separators=(",", ":")
-    ).encode("utf-8")
+    return json.dumps(response_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def prefix_response_content(response_payload: dict[str, Any], prefix: str) -> bool:
@@ -973,6 +798,9 @@ def prefix_response_content(response_payload: dict[str, Any], prefix: str) -> bo
         if not isinstance(message, dict):
             continue
         content = message.get("content")
-        message["content"] = prefix + (content if isinstance(content, str) else "")
+        if not isinstance(prefix, str) or not prefix:
+            message["content"] = content if isinstance(content, str) else ""
+        else:
+            message["content"] = prefix + (content if isinstance(content, str) else "")
         return True
     return False

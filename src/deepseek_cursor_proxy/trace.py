@@ -22,6 +22,10 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
 def authorization_summary(authorization: str | None) -> dict[str, Any]:
     if not authorization:
         return {"present": False}
@@ -101,9 +105,7 @@ def message_summaries(payload: dict[str, Any]) -> list[dict[str, Any]]:
             "tool_call_ids": tool_call_ids,
             "tool_call_id": message.get("tool_call_id"),
             "has_reasoning_content": isinstance(reasoning, str),
-            "reasoning_content_length": (
-                len(reasoning) if isinstance(reasoning, str) else 0
-            ),
+            "reasoning_content_length": (len(reasoning) if isinstance(reasoning, str) else 0),
             "has_recovery_notice": content.startswith(
                 (
                     "[deepseek-cursor-proxy] Refreshed reasoning_content history.",
@@ -128,11 +130,7 @@ def payload_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "model": payload.get("model"),
         "stream": bool(payload.get("stream")),
         "message_count": len(messages),
-        "tool_count": (
-            len(payload.get("tools") or [])
-            if isinstance(payload.get("tools"), list)
-            else 0
-        ),
+        "tool_count": (len(payload.get("tools") or []) if isinstance(payload.get("tools"), list) else 0),
         "tool_names": tool_names(payload),
         "system_prompt_hashes": system_hashes,
         "messages": message_summaries(payload),
@@ -151,13 +149,11 @@ def write_json_private(path: Path, payload: dict[str, Any]) -> None:
 
 
 class TraceWriter:
-    def __init__(self, base_dir: str | Path) -> None:
+    def __init__(self, base_dir: str | Path, *, sanitize_trace: bool = True) -> None:
+        self.sanitize_trace = sanitize_trace
         self.base_dir = Path(base_dir).expanduser()
         self.base_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        session_name = (
-            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-            + f"-pid{os.getpid()}"
-        )
+        session_name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + f"-pid{os.getpid()}"
         self.session_dir = self.base_dir / session_name
         self.session_dir.mkdir(mode=0o700)
         self._lock = threading.Lock()
@@ -221,24 +217,39 @@ class TraceRequest:
     _finished: bool = False
 
     def record_cursor_body(self, payload: dict[str, Any]) -> None:
-        self.data["request"]["body"] = payload
         self.data["request"]["summary"] = payload_summary(payload)
+        if not self.writer.sanitize_trace:
+            self.data["request"]["body"] = payload
 
     def record_cursor_body_bytes(self, body: bytes) -> None:
         self.data["request"]["body_bytes"] = len(body)
         text = body.decode("utf-8", errors="replace")
+        if self.writer.sanitize_trace:
+            self.data["request"]["body_sha256"] = sha256_bytes(body)
         try:
             payload = json.loads(text)
         except json.JSONDecodeError:
-            self.data["request"]["body"] = {"text": text}
+            if self.writer.sanitize_trace:
+                self.data["request"]["body_omitted"] = {
+                    "reason": "non_json",
+                    "body_bytes": len(body),
+                }
+            else:
+                self.data["request"]["body"] = {"text": text}
             return
-        self.data["request"]["body"] = payload
         if isinstance(payload, dict):
             self.data["request"]["summary"] = payload_summary(payload)
+            if not self.writer.sanitize_trace:
+                self.data["request"]["body"] = payload
+        elif self.writer.sanitize_trace:
+            self.data["request"]["body_omitted"] = {
+                "reason": "non_object",
+                "body_bytes": len(body),
+            }
+        else:
+            self.data["request"]["body"] = {"text": text}
 
-    def record_cursor_body_omitted(
-        self, *, reason: str, body_bytes: int | None = None
-    ) -> None:
+    def record_cursor_body_omitted(self, *, reason: str, body_bytes: int | None = None) -> None:
         omitted: dict[str, Any] = {"reason": reason}
         if body_bytes is not None:
             omitted["body_bytes"] = body_bytes
@@ -255,16 +266,15 @@ class TraceRequest:
             "recovery_dropped_messages": prepared.recovery_dropped_messages,
             "recovery_notice": prepared.recovery_notice,
             "record_response_scope": prepared.record_response_scope,
-            "record_response_scopes": [
-                scope for scope, _messages in prepared.record_response_contexts
-            ],
+            "record_response_scopes": [scope for scope, _messages in prepared.record_response_contexts],
             "continued_recovery_boundary": prepared.continued_recovery_boundary,
             "retired_prefix_messages": prepared.retired_prefix_messages,
             "reasoning_diagnostics": prepared.reasoning_diagnostics,
             "recovery_steps": prepared.recovery_steps,
             "upstream_request_summary": payload_summary(prepared.payload),
-            "upstream_request_body": prepared.payload,
         }
+        if not self.writer.sanitize_trace:
+            self.data["transform"]["upstream_request_body"] = prepared.payload
 
     def record_upstream_request(
         self,
@@ -293,7 +303,11 @@ class TraceRequest:
         if stream is not None:
             response["stream"] = stream
         if body is not None:
-            response["body"] = jsonable_body(body)
+            if self.writer.sanitize_trace:
+                response["body_bytes"] = len(body)
+                response["body_sha256"] = sha256_bytes(body)
+            else:
+                response["body"] = jsonable_body(body)
         self.data["upstream"]["response"] = response
 
     def record_cursor_response(
@@ -307,15 +321,27 @@ class TraceRequest:
         if headers is not None:
             response["headers"] = sanitized_headers(headers)
         if body is not None:
-            response["body"] = jsonable_body(body)
+            if self.writer.sanitize_trace:
+                response["body_bytes"] = len(body)
+                response["body_sha256"] = sha256_bytes(body)
+            else:
+                response["body"] = jsonable_body(body)
         self.data["cursor_response"].update(response)
 
     def record_stream_chunk(self, upstream_line: bytes, cursor_line: bytes) -> None:
         upstream_stream = self.data["upstream"].setdefault("stream", {"chunks": []})
-        cursor_stream = self.data["cursor_response"].setdefault(
-            "stream", {"chunks": []}
-        )
+        cursor_stream = self.data["cursor_response"].setdefault("stream", {"chunks": []})
         index = len(upstream_stream["chunks"])
+        if self.writer.sanitize_trace:
+            upstream_stream["chunks"].append(
+                {
+                    "index": index,
+                    "upstream_bytes": len(upstream_line),
+                    "cursor_bytes": len(cursor_line),
+                }
+            )
+            cursor_stream["chunks"].append({"index": index})
+            return
         upstream_stream["chunks"].append(
             {
                 "index": index,

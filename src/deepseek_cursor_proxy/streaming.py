@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import time
 from typing import Any
 
+from .logging import LOG
 from .reasoning_store import ReasoningStore
 
 
@@ -11,6 +12,18 @@ THINKING_BLOCK_START = "<think>\n"
 THINKING_BLOCK_END = "\n</think>\n\n"
 COLLAPSIBLE_THINKING_BLOCK_START = "<details>\n<summary>Thinking</summary>\n\n"
 COLLAPSIBLE_THINKING_BLOCK_END = "\n</details>\n\n"
+MAX_ACCUMULATED_FIELD_CHARS = 8 * 1024 * 1024
+
+
+def _append_capped(existing: str, delta: str, *, max_chars: int) -> tuple[str, bool]:
+    if not delta:
+        return existing, False
+    if len(existing) >= max_chars:
+        return existing, True
+    remaining = max_chars - len(existing)
+    if len(delta) <= remaining:
+        return existing + delta, False
+    return existing + delta[:remaining], True
 
 
 @dataclass
@@ -21,6 +34,8 @@ class StreamingChoice:
     has_reasoning_content: bool = False
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str | None = None
+    content_cap_warned: bool = False
+    reasoning_content_cap_warned: bool = False
 
     def to_message(self) -> dict[str, Any]:
         message: dict[str, Any] = {
@@ -63,14 +78,40 @@ class StreamAccumulator:
 
             content = delta.get("content")
             if isinstance(content, str):
-                choice.content += content
+                choice.content, truncated = _append_capped(
+                    choice.content,
+                    content,
+                    max_chars=MAX_ACCUMULATED_FIELD_CHARS,
+                )
+                if truncated and not choice.content_cap_warned:
+                    self._warn_cap_reached(index, "content")
+                    choice.content_cap_warned = True
 
             reasoning_content = delta.get("reasoning_content")
+            if not isinstance(reasoning_content, str):
+                reasoning_content = delta.get("reasoning")
             if isinstance(reasoning_content, str):
                 choice.has_reasoning_content = True
-                choice.reasoning_content += reasoning_content
+                choice.reasoning_content, truncated = _append_capped(
+                    choice.reasoning_content,
+                    reasoning_content,
+                    max_chars=MAX_ACCUMULATED_FIELD_CHARS,
+                )
+                if truncated and not choice.reasoning_content_cap_warned:
+                    self._warn_cap_reached(index, "reasoning_content")
+                    choice.reasoning_content_cap_warned = True
+                if "reasoning_content" not in delta:
+                    delta["reasoning_content"] = reasoning_content
 
             self._merge_tool_call_deltas(choice, delta.get("tool_calls"))
+
+    def _warn_cap_reached(self, index: int, field_name: str) -> None:
+        LOG.warning(
+            "stream accumulator cap reached choice=%s field=%s max_chars=%s; truncating additional text",
+            index,
+            field_name,
+            MAX_ACCUMULATED_FIELD_CHARS,
+        )
 
     def store_reasoning(
         self,
@@ -81,9 +122,7 @@ class StreamAccumulator:
     ) -> int:
         stored = 0
         for index, choice in self.choices.items():
-            stored += self._store_choice(
-                index, choice, store, scope, "final", cache_namespace, prior_messages
-            )
+            stored += self._store_choice(index, choice, store, scope, "final", cache_namespace, prior_messages)
         return stored
 
     def store_finished_reasoning(
@@ -152,9 +191,7 @@ class StreamAccumulator:
             if not isinstance(index, int):
                 index = len(choice.tool_calls)
             while len(choice.tool_calls) <= index:
-                choice.tool_calls.append(
-                    {"type": "function", "function": {"name": "", "arguments": ""}}
-                )
+                choice.tool_calls.append({"type": "function", "function": {"name": "", "arguments": ""}})
 
             tool_call = choice.tool_calls[index]
             if raw_delta.get("id"):
@@ -169,16 +206,9 @@ class StreamAccumulator:
             if function_delta.get("name"):
                 existing_name = function.get("name") or ""
                 new_name = str(function_delta["name"])
-                function["name"] = (
-                    new_name if not existing_name else existing_name + new_name
-                )
-            if (
-                "arguments" in function_delta
-                and function_delta["arguments"] is not None
-            ):
-                function["arguments"] = (function.get("arguments") or "") + str(
-                    function_delta["arguments"]
-                )
+                function["name"] = new_name if not existing_name else existing_name + new_name
+            if "arguments" in function_delta and function_delta["arguments"] is not None:
+                function["arguments"] = (function.get("arguments") or "") + str(function_delta["arguments"])
 
     def _store_choice(
         self,
@@ -217,12 +247,8 @@ class CursorReasoningDisplayAdapter:
     def __init__(self, collapsible: bool = True) -> None:
         self._open_choices: set[int] = set()
         self._last_chunk_metadata: dict[str, Any] = {}
-        self._block_start = (
-            COLLAPSIBLE_THINKING_BLOCK_START if collapsible else THINKING_BLOCK_START
-        )
-        self._block_end = (
-            COLLAPSIBLE_THINKING_BLOCK_END if collapsible else THINKING_BLOCK_END
-        )
+        self._block_start = COLLAPSIBLE_THINKING_BLOCK_START if collapsible else THINKING_BLOCK_START
+        self._block_end = COLLAPSIBLE_THINKING_BLOCK_END if collapsible else THINKING_BLOCK_END
 
     def rewrite_chunk(self, chunk: dict[str, Any]) -> None:
         self._remember_chunk_metadata(chunk)
@@ -241,7 +267,11 @@ class CursorReasoningDisplayAdapter:
 
             mirrored_parts: list[str] = []
             reasoning_content = delta.get("reasoning_content")
+            if not isinstance(reasoning_content, str):
+                reasoning_content = delta.get("reasoning")
             if isinstance(reasoning_content, str) and reasoning_content:
+                if "reasoning_content" not in delta:
+                    delta["reasoning_content"] = reasoning_content
                 if index not in self._open_choices:
                     mirrored_parts.append(self._block_start)
                     self._open_choices.add(index)
@@ -249,9 +279,7 @@ class CursorReasoningDisplayAdapter:
 
             existing_content = delta.get("content")
             should_close = index in self._open_choices and (
-                bool(existing_content)
-                or bool(delta.get("tool_calls"))
-                or raw_choice.get("finish_reason") is not None
+                bool(existing_content) or bool(delta.get("tool_calls")) or raw_choice.get("finish_reason") is not None
             )
             if should_close:
                 mirrored_parts.append(self._block_end)
@@ -287,9 +315,7 @@ class CursorReasoningDisplayAdapter:
         return chunk
 
     def _remember_chunk_metadata(self, chunk: dict[str, Any]) -> None:
-        metadata = {
-            key: chunk[key] for key in ("id", "object", "created") if key in chunk
-        }
+        metadata = {key: chunk[key] for key in ("id", "object", "created") if key in chunk}
         if metadata:
             self._last_chunk_metadata.update(metadata)
 
@@ -300,9 +326,7 @@ def fold_reasoning_into_content(
 ) -> None:
     """Mirror `reasoning_content` into the visible `content` field for
     non-streaming responses, matching the streaming `<details>` layout."""
-    block_start = (
-        COLLAPSIBLE_THINKING_BLOCK_START if collapsible else THINKING_BLOCK_START
-    )
+    block_start = COLLAPSIBLE_THINKING_BLOCK_START if collapsible else THINKING_BLOCK_START
     block_end = COLLAPSIBLE_THINKING_BLOCK_END if collapsible else THINKING_BLOCK_END
     choices = response_payload.get("choices")
     if not isinstance(choices, list):
@@ -314,12 +338,9 @@ def fold_reasoning_into_content(
         if not isinstance(message, dict):
             continue
         reasoning = message.get("reasoning_content")
+        if not isinstance(reasoning, str):
+            reasoning = message.get("reasoning")
         if not isinstance(reasoning, str) or not reasoning:
             continue
         content = message.get("content")
-        message["content"] = (
-            block_start
-            + reasoning
-            + block_end
-            + (content if isinstance(content, str) else "")
-        )
+        message["content"] = block_start + reasoning + block_end + (content if isinstance(content, str) else "")

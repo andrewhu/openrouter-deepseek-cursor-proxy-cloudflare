@@ -17,13 +17,20 @@ import json
 import logging
 from pathlib import Path
 import re
-import threading
 import time
 from types import SimpleNamespace
 import unittest
 import zlib
+from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+from tests.support.fixtures import (
+    HttpServerFixture,
+    TEST_API_KEY,
+    TEST_API_KEY_HASH,
+    post_json,
+)
 
 from deepseek_cursor_proxy.config import ProxyConfig
 from deepseek_cursor_proxy.logging import (
@@ -34,6 +41,7 @@ from deepseek_cursor_proxy.reasoning_store import ReasoningStore
 from deepseek_cursor_proxy.server import (
     DeepSeekProxyHandler,
     DeepSeekProxyServer,
+    _sanitize_for_logging,
     build_arg_parser,
     read_response_body,
     summarize_chat_payload,
@@ -115,6 +123,38 @@ def _make_handler_stub(wfile: object, **config: object) -> DeepSeekProxyHandler:
     return handler
 
 
+class SanitizeForLoggingTests(unittest.TestCase):
+    def test_truncates_long_reasoning_content(self) -> None:
+        long_reasoning = "R" * 500
+        sanitized = _sanitize_for_logging({"messages": [{"role": "assistant", "reasoning_content": long_reasoning}]})
+        value = sanitized["messages"][0]["reasoning_content"]
+        self.assertTrue(value.endswith("..."))
+        self.assertLess(len(value), len(long_reasoning))
+
+    def test_truncates_long_tool_arguments(self) -> None:
+        long_args = "A" * 500
+        sanitized = _sanitize_for_logging(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "foo",
+                                    "arguments": long_args,
+                                }
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        value = sanitized["messages"][0]["tool_calls"][0]["function"]["arguments"]
+        self.assertTrue(value.endswith("..."))
+        self.assertLess(len(value), len(long_args))
+
+
 # ---------------------------------------------------------------------------
 # CLI / pure helpers
 # ---------------------------------------------------------------------------
@@ -124,27 +164,19 @@ class CliAndHelperTests(unittest.TestCase):
     def test_cli_boolean_flags_have_on_and_off_forms(self) -> None:
         args = build_arg_parser().parse_args(
             [
-                "--no-ngrok",
+                "--local",
                 "--no-verbose",
-                "--no-display-reasoning",
-                "--no-collasible-resoning",
-                "--cors",
                 "--trace-dir",
                 "/tmp/dcp-traces",
             ]
         )
-        self.assertFalse(args.ngrok)
+        self.assertTrue(args.local)
         self.assertFalse(args.verbose)
-        self.assertFalse(args.display_reasoning)
-        self.assertFalse(args.collapsible_reasoning)
-        self.assertTrue(args.cors)
         self.assertEqual(args.trace_dir, Path("/tmp/dcp-traces"))
 
-    def test_cli_accepts_ngrok_url(self) -> None:
-        args = build_arg_parser().parse_args(
-            ["--ngrok-url", "https://example.ngrok.app"]
-        )
-        self.assertEqual(args.ngrok_url, "https://example.ngrok.app")
+    def test_cli_accepts_tunnel_url(self) -> None:
+        args = build_arg_parser().parse_args(["--tunnel-url", "https://proxy.example.com"])
+        self.assertEqual(args.tunnel_url, "https://proxy.example.com")
 
     def test_default_console_logging_hides_info_prefix_and_timestamp(self) -> None:
         formatter = ConsoleLogFormatter(verbose=False)
@@ -171,9 +203,7 @@ class CliAndHelperTests(unittest.TestCase):
             formatter.format(info_record),
             "listening on http://127.0.0.1:9000/v1",
         )
-        self.assertEqual(
-            formatter.format(warning_record), "WARNING trace logging enabled"
-        )
+        self.assertEqual(formatter.format(warning_record), "WARNING trace logging enabled")
 
     def test_verbose_console_logging_shows_timestamp_and_level(self) -> None:
         formatter = ConsoleLogFormatter(verbose=True)
@@ -189,16 +219,12 @@ class CliAndHelperTests(unittest.TestCase):
 
         self.assertRegex(
             formatter.format(record),
-            re.compile(
-                r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} INFO listening on "
-            ),
+            re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} INFO listening on "),
         )
 
     def test_terminal_spinner_animates_only_for_tty(self) -> None:
         tty = _FakeConsole(tty=True)
-        spinner = TerminalSpinner(
-            enabled=True, text="└ {frame}", stream=tty, interval=0.001
-        ).start()
+        spinner = TerminalSpinner(enabled=True, text="└ {frame}", stream=tty, interval=0.001).start()
         deadline = time.monotonic() + 0.2
         while time.monotonic() < deadline and not tty.writes:
             time.sleep(0.001)
@@ -211,9 +237,7 @@ class CliAndHelperTests(unittest.TestCase):
         self.assertTrue(output.endswith(TerminalSpinner.show_cursor))
 
         non_tty = _FakeConsole(tty=False)
-        TerminalSpinner(
-            enabled=True, text="└ {frame}", stream=non_tty, interval=0.001
-        ).start().stop()
+        TerminalSpinner(enabled=True, text="└ {frame}", stream=non_tty, interval=0.001).start().stop()
         self.assertEqual(non_tty.writes, [])
 
     def test_read_response_body_decodes_gzip_and_deflate(self) -> None:
@@ -316,15 +340,11 @@ class HandlerStubTests(unittest.TestCase):
         finally:
             handler.server.reasoning_store.close()
         self.assertFalse(result.sent)
-        self.assertIn(
-            "upstream streaming response read failed", "\n".join(captured.output)
-        )
+        self.assertIn("upstream streaming response read failed", "\n".join(captured.output))
 
-    def test_collapsible_reasoning_no_effect_when_display_disabled(self) -> None:
+    def test_streaming_always_mirrors_reasoning_into_collapsible_details(self) -> None:
         wfile = BytesIO()
-        handler = _make_handler_stub(
-            wfile, display_reasoning=False, collapsible_reasoning=True
-        )
+        handler = _make_handler_stub(wfile)
         chunk = {
             "id": "stream",
             "model": "deepseek-v4-pro",
@@ -347,7 +367,7 @@ class HandlerStubTests(unittest.TestCase):
             handler.server.reasoning_store.close()
         body = wfile.getvalue().decode("utf-8")
         self.assertIn("reasoning_content", body)
-        self.assertNotIn("<details>", body)
+        self.assertIn("<details>", body)
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +381,7 @@ class _PlainFakeUpstream(BaseHTTPRequestHandler):
     requests: list[dict[str, object]] = []
     auth_headers: list[str] = []
     delay_after_done: float = 0.0
+    status_code: int = 200
     response: dict[str, object] = {}
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -376,9 +397,7 @@ class _PlainFakeUpstream(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
-            self.wfile.write(
-                b'data: {"choices":[{"index":0,"delta":{"content":"x"}}]}\n\n'
-            )
+            self.wfile.write(b'data: {"choices":[{"index":0,"delta":{"content":"x"}}]}\n\n')
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
             if self.__class__.delay_after_done:
@@ -386,7 +405,7 @@ class _PlainFakeUpstream(BaseHTTPRequestHandler):
             return
 
         body = json.dumps(self.__class__.response).encode("utf-8")
-        self.send_response(200)
+        self.send_response(self.__class__.status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -416,40 +435,6 @@ _BASE_RESPONSE: dict[str, object] = {
 }
 
 
-class _Fixture:
-    def __init__(self, server: ThreadingHTTPServer) -> None:
-        self.server = server
-        self.thread = threading.Thread(target=server.serve_forever, daemon=True)
-        self.thread.start()
-
-    @property
-    def url(self) -> str:
-        host, port = self.server.server_address
-        return f"http://{host}:{port}"
-
-    def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
-
-
-def _post(url: str, payload: dict, api_key: str = "sk-test") -> tuple[int, dict]:
-    request = Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urlopen(request, timeout=5) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        return exc.code, json.loads(exc.read().decode("utf-8"))
-
-
 class HttpBoundaryTests(unittest.TestCase):
     """Real-HTTP tests that don't fit the protocol suite: things the proxy
     must do at the HTTP boundary regardless of what DeepSeek answers."""
@@ -458,19 +443,17 @@ class HttpBoundaryTests(unittest.TestCase):
         _PlainFakeUpstream.requests = []
         _PlainFakeUpstream.auth_headers = []
         _PlainFakeUpstream.delay_after_done = 0.0
+        _PlainFakeUpstream.status_code = 200
         _PlainFakeUpstream.response = dict(_BASE_RESPONSE)
-        self.upstream = _Fixture(
-            ThreadingHTTPServer(("127.0.0.1", 0), _PlainFakeUpstream)
-        )
+        self.upstream = HttpServerFixture(ThreadingHTTPServer(("127.0.0.1", 0), _PlainFakeUpstream))
         self.store = ReasoningStore(":memory:")
         proxy = DeepSeekProxyServer(("127.0.0.1", 0), DeepSeekProxyHandler)
         proxy.config = ProxyConfig(
             upstream_base_url=self.upstream.url,
-            upstream_model="deepseek-v4-pro",
-            ngrok=False,
+            proxy_api_key_hash=TEST_API_KEY_HASH,
         )
         proxy.reasoning_store = self.store
-        self.proxy = _Fixture(proxy)
+        self.proxy = HttpServerFixture(proxy)
 
     def tearDown(self) -> None:
         self.proxy.close()
@@ -495,25 +478,72 @@ class HttpBoundaryTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 401)
         self.assertEqual(_PlainFakeUpstream.requests, [])
 
+    def test_accepts_valid_api_key(self) -> None:
+        status, _ = post_json(f"{self.proxy.url}/v1/chat/completions", self._request())
+        self.assertEqual(status, 200)
+
+    def test_rejects_invalid_api_key(self) -> None:
+        status, payload = post_json(
+            f"{self.proxy.url}/v1/chat/completions",
+            self._request(),
+            authorization="Bearer sk-wrong",
+        )
+        self.assertEqual(status, 401)
+        self.assertIn("Invalid", payload["error"]["message"])
+        self.assertEqual(_PlainFakeUpstream.requests, [])
+
+    def test_rejects_chat_when_tunnel_dead(self) -> None:
+        self.proxy.server.tunnel = SimpleNamespace(
+            dead=True,
+            tunnel_url="https://proxy.example.com",
+        )
+        status, payload = post_json(
+            f"{self.proxy.url}/v1/chat/completions",
+            self._request(),
+            authorization=f"Bearer {TEST_API_KEY}",
+        )
+        self.assertEqual(status, 503)
+        self.assertIn("tunnel", payload["error"]["message"].lower())
+        self.assertEqual(_PlainFakeUpstream.requests, [])
+
+    def test_rejects_models_when_tunnel_dead(self) -> None:
+        self.proxy.server.tunnel = SimpleNamespace(
+            dead=True,
+            tunnel_url="https://proxy.example.com",
+        )
+        request = Request(
+            f"{self.proxy.url}/v1/models",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=2)
+        self.assertEqual(caught.exception.code, 503)
+        body = json.loads(caught.exception.read().decode("utf-8"))
+        self.assertIn("tunnel", body["error"]["message"].lower())
+
     def test_rejects_oversized_request_body(self) -> None:
-        self.proxy.server.config = replace(
-            self.proxy.server.config, max_request_body_bytes=10
-        )
-        status, payload = _post(
-            f"{self.proxy.url}/v1/chat/completions", self._request()
-        )
+        with patch("deepseek_cursor_proxy.server.DEFAULT_MAX_REQUEST_BODY_BYTES", 10):
+            status, payload = post_json(f"{self.proxy.url}/v1/chat/completions", self._request())
         self.assertEqual(status, 413)
         self.assertIn("too large", payload["error"]["message"])
         self.assertEqual(_PlainFakeUpstream.requests, [])
 
+    def test_forwards_openrouter_upstream_error_without_rewrite(self) -> None:
+        _PlainFakeUpstream.status_code = 401
+        _PlainFakeUpstream.response = {"error": {"message": "invalid OpenRouter API key", "code": 401}}
+        status, payload = post_json(f"{self.proxy.url}/v1/chat/completions", self._request())
+        self.assertEqual(status, 401)
+        self.assertEqual(payload["error"]["message"], "invalid OpenRouter API key")
+        self.assertNotIn("choices", payload)
+
     def test_forwards_bearer_token_to_upstream(self) -> None:
-        status, _ = _post(
+        status, _ = post_json(
             f"{self.proxy.url}/v1/chat/completions",
             self._request(),
-            api_key="sk-from-cursor",
+            authorization=f"Bearer {TEST_API_KEY}",
         )
         self.assertEqual(status, 200)
-        self.assertEqual(_PlainFakeUpstream.auth_headers[0], "Bearer sk-from-cursor")
+        self.assertEqual(_PlainFakeUpstream.auth_headers[0], f"Bearer {TEST_API_KEY}")
 
     def test_streaming_response_closes_after_done_when_upstream_lingers(
         self,
@@ -544,45 +574,98 @@ class HttpBoundaryTests(unittest.TestCase):
 
     def test_normal_logging_summarizes_without_bodies_or_keys(self) -> None:
         with self.assertLogs("deepseek_cursor_proxy", level="INFO") as captured:
-            status, _ = _post(
+            status, _ = post_json(
                 f"{self.proxy.url}/v1/chat/completions",
                 self._request(),
-                api_key="sk-from-cursor",
+                authorization=f"Bearer {TEST_API_KEY}",
             )
             # `└ stats` is emitted on the handler thread *after* the response
             # body hits the socket, so the client may return before it lands.
             deadline = time.monotonic() + 2
-            while time.monotonic() < deadline and not any(
-                "└ stats" in record for record in captured.output
-            ):
+            while time.monotonic() < deadline and not any("└ stats" in record for record in captured.output):
                 time.sleep(0.01)
         output = "\n".join(captured.output)
         self.assertEqual(status, 200)
-        self.assertIn("┌ request model=deepseek-v4-pro effort=max messages=1", output)
+        self.assertIn("┌ request model=deepseek-v4-pro effort=xhigh messages=1", output)
         self.assertIn("├ context status=ok reasoning_context=0", output)
         self.assertIn("└ stats", output)
         self.assertNotIn(" tools=", output)
         self.assertNotIn("├ send", output)
-        self.assertNotIn("hi", output.split("┌ request")[1].split("\n")[0])
+        request_summary_line = output.split("┌ request", 1)[1].split("\n", 1)[0]
+        self.assertNotIn('"content"', request_summary_line)
         self.assertNotIn("sk-from-cursor", output)
 
     def test_verbose_logging_includes_bodies_but_redacts_api_key(self) -> None:
         self.proxy.server.config = replace(self.proxy.server.config, verbose=True)
         with self.assertLogs("deepseek_cursor_proxy", level="INFO") as captured:
-            _post(
+            post_json(
                 f"{self.proxy.url}/v1/chat/completions",
                 self._request(),
-                api_key="sk-from-cursor",
+                authorization=f"Bearer {TEST_API_KEY}",
             )
         output = "\n".join(captured.output)
         self.assertIn("cursor request body", output)
         self.assertIn("upstream request body", output)
         self.assertNotIn("sk-from-cursor", output)
 
-    def test_healthz_returns_ok(self) -> None:
-        with urlopen(f"{self.proxy.url}/healthz", timeout=2) as response:
+    def test_models_lists_only_deepseek_v4_pro(self) -> None:
+        request = Request(
+            f"{self.proxy.url}/v1/models",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        with urlopen(request, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        model_ids = [item["id"] for item in payload["data"]]
+        self.assertEqual(model_ids, ["deepseek-v4-pro"])
+
+    def test_healthz_returns_ok_with_auth(self) -> None:
+        request = Request(
+            f"{self.proxy.url}/healthz",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+        with urlopen(request, timeout=2) as response:
             self.assertEqual(response.status, 200)
             self.assertEqual(json.loads(response.read())["ok"], True)
+
+    def test_healthz_requires_auth(self) -> None:
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(f"{self.proxy.url}/healthz", timeout=2)
+        self.assertEqual(caught.exception.code, 401)
+
+    def test_main_exits_without_proxy_api_key_hash(self) -> None:
+        from deepseek_cursor_proxy.server import main
+
+        config = replace(
+            ProxyConfig(),
+            tunnel_url="https://proxy.example.com",
+            proxy_api_key_hash=None,
+        )
+        with patch("deepseek_cursor_proxy.server.ProxyConfig.from_file", return_value=config):
+            with patch("deepseek_cursor_proxy.server.configure_logging"):
+                exit_code = main([])
+        self.assertEqual(exit_code, 2)
+
+    def test_main_local_mode_skips_tunnel_requirements(self) -> None:
+        from deepseek_cursor_proxy.server import main
+
+        config = replace(
+            ProxyConfig(),
+            proxy_api_key_hash=TEST_API_KEY_HASH,
+            tunnel_url=None,
+        )
+        with patch("deepseek_cursor_proxy.server.ProxyConfig.from_file", return_value=config):
+            with patch("deepseek_cursor_proxy.server.configure_logging"):
+                with patch("deepseek_cursor_proxy.server.ReasoningStore") as store_cls:
+                    store = MagicMock()
+                    store_cls.return_value = store
+                    with patch("deepseek_cursor_proxy.server.DeepSeekProxyServer") as server_cls:
+                        server = MagicMock()
+                        server_cls.return_value = server
+                        with patch("deepseek_cursor_proxy.server.CloudflareTunnel") as tunnel_cls:
+                            exit_code = main(["--local"])
+        self.assertEqual(exit_code, 0)
+        tunnel_cls.assert_not_called()
+        server.serve_forever.assert_called_once()
 
 
 if __name__ == "__main__":

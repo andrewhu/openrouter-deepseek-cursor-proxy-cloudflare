@@ -1,20 +1,46 @@
-<!-- <h1><img src="assets/logo.png" width="120" alt="deepseek-cursor-proxy logo" style="vertical-align: middle;">&nbsp;DeepSeek Cursor Proxy</h1> -->
-<h1 align="center"><img src="assets/logo.png" width="150" alt="deepseek-cursor-proxy logo"><br>DeepSeek Cursor Proxy</h1>
+<h1>Cloudflare + OpenRouter DeepSeek Cursor Proxy</h1>
 
-A compatibility proxy that connects Cursor to DeepSeek thinking models (`deepseek-v4-pro` and `deepseek-v4-flash`) by properly handling the `reasoning_content` field for DeepSeek tool-call reasoning API requests.
+## Purpose
 
-This proxy can also help **other applications and coding agents** beyond Cursor that run into the same missing `reasoning_content` issue with DeepSeek's thinking-mode API. Just point their API base URL at the proxy.
+This is an **opinionated, single-user bridge** that lets you run **DeepSeek V4 Pro in Cursor agent mode** with **extra-high thinking** (`reasoning.effort: xhigh`) without hitting DeepSeek’s `reasoning_content` tool-call errors.
 
-## What It Does
+It is **not** a general-purpose API gateway. The upstream model, provider routing, thinking effort, reasoning repair, recovery behavior, and Cursor thinking UI are **fixed in code** for one workflow: **Cursor → your Cloudflare Tunnel → this proxy → OpenRouter → DeepSeek’s first-party provider only**.
 
-- ✅ Injects `reasoning_content` into outgoing tool-call requests since Cursor does not include the field, restoring previously cached reasoning from regular and streamed DeepSeek responses. See [DeepSeek docs](https://api-docs.deepseek.com/guides/thinking_mode#tool-calls) for more details.
-- ✅ Displays DeepSeek's thinking tokens in Cursor by forwarding them into Cursor-visible collapsible Markdown `<details><summary>Thinking</summary>...</details>` blocks.
-- ✅ Starts an ngrok tunnel so Cursor can reach the local proxy through a public HTTPS URL.
-- ✅ Provides other compatibility fixes to make DeepSeek models run well in Cursor.
+If you need multiple models, alternate providers, lower reasoning effort, or a shared multi-tenant relay, use [OpenRouter](https://openrouter.ai/) or another proxy directly instead of forking this repo.
 
-## Why This Exists
+## Who this is for
 
-This repository fixes the following Cursor + DeepSeek tool-call error with thinking mode enabled:
+The design matches a **personal always-on setup** (for example, a Mac Mini on home Wi‑Fi). See [Always-on Mac Mini (launchd)](#always-on-mac-mini-launchd) to run the proxy at boot.
+
+- **One person** uses the proxy (your machine, your tunnel hostname).
+- **One OpenRouter API key** — Cursor sends it as the Bearer token; the proxy checks `sha256(key)` so your public tunnel URL is not an open relay for arbitrary keys. This is a lightweight personal-use gate, not a production security boundary.
+- **One model in Cursor:** `deepseek-v4-pro` (mapped upstream to `deepseek/deepseek-v4-pro`).
+- **Production path always uses a named Cloudflare Tunnel** on your own domain (Cursor cannot call `localhost`). `--local` exists only for unit tests and manual debugging.
+
+## Hardcoded behavior (not configurable)
+
+| Area | Fixed choice |
+|------|----------------|
+| Upstream | [OpenRouter](https://openrouter.ai/api/v1) only (not `api.deepseek.com`) |
+| Model | `deepseek/deepseek-v4-pro` (Cursor id: `deepseek-v4-pro`) |
+| Provider | `provider.only: ["deepseek"]` — OpenRouter’s first-party DeepSeek route; **no third-party fallbacks** |
+| Thinking | Always on; `reasoning.effort: xhigh` on every upstream request |
+| Missing `reasoning_content` | Always repair from SQLite cache; if still missing, **recover** (truncate history + notice) |
+| Cursor UI | Always mirror thinking into collapsible `<details><summary>Thinking</summary>…</details>` blocks |
+| Tunnel | Named tunnel `deepseek-proxy` + your `tunnel_url` in config |
+| Config surface | `proxy_api_key_hash`, `tunnel_url`, bind `host`/`port`, `verbose` — see generated `~/.deepseek-cursor-proxy/config.yaml` |
+
+## What it does
+
+- Routes every request through OpenRouter to **DeepSeek V4 Pro** with **xhigh** reasoning on the **DeepSeek provider only**.
+- Injects `reasoning_content` into outgoing tool-call turns (Cursor omits it), restoring prior reasoning from regular and streamed responses via a local SQLite cache.
+- Shows thinking tokens in Cursor as collapsible Markdown thinking blocks.
+- Starts **cloudflared** on normal launch so Cursor reaches the proxy over HTTPS on your domain.
+- Applies small protocol shims (tools/function_call conversion, content flattening, etc.) so agent mode stays stable.
+
+## Why this exists
+
+Cursor + DeepSeek thinking mode breaks on multi-step tool calls when prior `reasoning_content` is not sent back:
 
 <img src="assets/error_400.png" width="600" alt="Error 400 - reasoning_content must be passed back">
 
@@ -31,171 +57,262 @@ Provider returned error:
 }
 ```
 
+This proxy caches reasoning from upstream responses and patches it into later requests so agent loops can continue.
+
 ## Usage
 
-### Step 1: Set Up ngrok
+### Step 1: Set up Cloudflare Tunnel
 
-Cursor blocks non-public API URLs such as `localhost`, so the proxy needs a public HTTPS URL. [ngrok](https://ngrok.com/) can expose the local proxy to Cursor without opening router ports. Alternatively, you may use [Cloudflare Tunnel](https://developers.cloudflare.com/tunnel/setup/). Create an ngrok account and visit [ngrok's dashboard](https://dashboard.ngrok.com). You will find the authtoken and public URL there.
+Cursor blocks non-public API URLs such as `localhost`, so the proxy needs a public HTTPS URL. [Cloudflare Tunnels](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) expose the local proxy with a stable hostname on your domain.
 
-If you're using this proxy with another application that allows localhost API endpoints, you can skip this step entirely by setting `ngrok: false` in `~/.deepseek-cursor-proxy/config.yaml`, or by starting the proxy with `--no-ngrok`.
-
-<img src="assets/ngrok_dashboard.png" width="600" alt="ngrok dashboard">
-
-Then, install and authenticate ngrok once:
+One-time setup:
 
 ```bash
-brew install ngrok
-ngrok config add-authtoken <your-ngrok-token>
+# Install cloudflared
+brew install cloudflared
+
+# Authenticate with Cloudflare (opens browser)
+cloudflared tunnel login
+
+# Create a named tunnel (name is fixed in the proxy)
+cloudflared tunnel create deepseek-proxy
+
+# Route your domain to the tunnel
+cloudflared tunnel route dns deepseek-proxy proxy.yourdomain.com
 ```
 
-### Step 2: Install and Start the Proxy Server
-
-**Run with UV**
+### Step 2: Install and start the proxy
 
 ```bash
 # Install uv if you don't have it
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Install and start
-# uv installs the program in .venv/ under the repo local folder
 git clone https://github.com/yxlao/deepseek-cursor-proxy.git
 cd deepseek-cursor-proxy
 uv run deepseek-cursor-proxy
 ```
 
-**Run with Conda**
-
-```bash
-# Install conda if you don't have it
-# Follow: https://www.anaconda.com/docs/getting-started/miniconda/install/overview
-
-# Install
-conda create -n dcp python=3.10 -y
-conda activate dcp
-git clone https://github.com/yxlao/deepseek-cursor-proxy.git
-cd deepseek-cursor-proxy
-pip install -e .
-
-# Start
-deepseek-cursor-proxy
-```
-
-When ngrok is enabled, `deepseek-cursor-proxy` will print the ngrok public URL on start. If it differs from the one in Cursor, update it in Cursor's Base URL field.
-
-If you use a **reserved ngrok endpoint or your own domain** (instead of a URL assigned by ngrok), pass it through to the ngrok agent as `--url=…`. Set `ngrok_url` in `~/.deepseek-cursor-proxy/config.yaml` or use `--ngrok-url` on the command line (see `ngrok http --help`). Example:
+On first run the proxy creates `~/.deepseek-cursor-proxy/config.yaml` and exits until `proxy_api_key_hash` and `tunnel_url` are set. Edit it to match your install (see [`config.example.yaml`](config.example.yaml) for the full template):
 
 ```yaml
-ngrok: true
-ngrok_url: https://your-subdomain.ngrok.dev
+proxy_api_key_hash: "<sha256-of-your-openrouter-api-key>"
+tunnel_url: https://proxy.yourdomain.com
 ```
+
+Generate the hash without putting your key in shell history:
 
 ```bash
-deepseek-cursor-proxy --ngrok-url https://your-subdomain.ngrok.dev
+python -c "import hashlib, getpass; k=getpass.getpass('OpenRouter key: '); print(hashlib.sha256(k.encode()).hexdigest())"
 ```
 
-On the first run, `deepseek-cursor-proxy` will create:
+Store the hash in `~/.deepseek-cursor-proxy/config.yaml` only. Put the real OpenRouter key in Cursor settings. Keeping the raw key out of the repo is still recommended because it avoids accidental cleanup work, even when the key has a low monthly spend cap. Repo-local files such as `dev.config.yaml` are gitignored and excluded from Cursor AI context, but the home-directory config is the canonical location.
 
-- `~/.deepseek-cursor-proxy/config.yaml`: the configuration file
-- `~/.deepseek-cursor-proxy/reasoning_content.sqlite3`: the reasoning content cache
+Only that key is accepted; other Bearer tokens get HTTP 401.
 
-Persistent settings live in `~/.deepseek-cursor-proxy/config.yaml`. You can also override the config with command-line flags, for example:
+**Do not use TryCloudflare quick tunnels** (`*.trycloudflare.com`) — they do not support Server-Sent Events (SSE), which Cursor streaming needs. Use a named tunnel on your own domain.
+
+Optional: add [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) on the hostname if you want an extra gate in front of the tunnel.
+
+The proxy writes ingress config under `~/.deepseek-cursor-proxy/tunnels/deepseek-proxy.yml` using credentials from `~/.cloudflared/<tunnel-uuid>.json`.
+
+Override the public URL without editing config:
 
 ```bash
-# Hide thinking tokens displaying in Cursor UI
-deepseek-cursor-proxy --no-display-reasoning
-
-# Show full incoming and outgoing requests
-deepseek-cursor-proxy --verbose
-
-# Run without ngrok (run on localhost directly)
-deepseek-cursor-proxy --no-ngrok
-
-# Use a fixed ngrok public URL (reserved endpoint / custom domain)
-deepseek-cursor-proxy --ngrok-url https://your-subdomain.ngrok.dev
-
-# Use a different local port
-deepseek-cursor-proxy --port 9000
+deepseek-cursor-proxy --tunnel-url https://proxy.yourdomain.com
 ```
 
-### Step 3: Add Cursor Custom Model
+**Local / dev only** (no tunnel — unit tests and curl; Cursor cannot use localhost):
 
-In Cursor, add the DeepSeek custom model and point it at this proxy:
+```bash
+deepseek-cursor-proxy --local --verbose
+```
 
-- Model: `deepseek-v4-pro`
-- API Key: your DeepSeek API key
-- Base URL: your ngrok HTTPS URL with the `/v1` API version path
+First-run artifacts:
 
-The proxy respects the DeepSeek model name Cursor sends, such as `deepseek-v4-pro` or `deepseek-v4-flash`. The `model` field in `config.yaml` is used as a fallback only when a request does not include a model.
+- `~/.deepseek-cursor-proxy/config.yaml`
+- `~/.deepseek-cursor-proxy/reasoning_content.sqlite3` (reasoning cache)
 
-For example, if ngrok dashboard shows `https://example.ngrok-free.dev`, use:
+Other flags:
+
+```bash
+deepseek-cursor-proxy --verbose                # log detailed metadata with truncated message fields
+deepseek-cursor-proxy --port 9000              # change local bind port
+deepseek-cursor-proxy --trace-dir ./trace-dumps # write sanitized request traces
+deepseek-cursor-proxy --clear-reasoning-cache  # wipe reasoning SQLite cache
+```
+
+### Always-on Mac Mini (launchd)
+
+Use a **LaunchDaemon** so the proxy (and its `cloudflared` subprocess) start at **boot**, without anyone logging in. The daemon runs as your macOS user so it can read `~/.cloudflared/` and `~/.deepseek-cursor-proxy/`.
 
 ```text
-https://example.ngrok-free.dev/v1
+Mac reboot → launchd → deepseek-cursor-proxy → cloudflared → Cursor over HTTPS → OpenRouter
 ```
+
+**Prerequisites** — complete [Step 1](#step-1-set-up-cloudflare-tunnel) and [Step 2](#step-2-install-and-start-the-proxy) first:
+
+1. `cloudflared` installed; tunnel `deepseek-proxy` created and DNS routed.
+2. `~/.deepseek-cursor-proxy/config.yaml` has valid `proxy_api_key_hash` and `tunnel_url`.
+3. `~/.cloudflared/<tunnel-uuid>.json` exists for the same user you will set as `UserName` in the plist.
+4. A manual run succeeds: `uv run deepseek-cursor-proxy` (no `--local`) until logs show **PUBLIC TUNNEL ACTIVE**.
+
+Do **not** run `cloudflared` via `brew services` separately — the proxy starts and monitors `cloudflared` itself; a second tunnel process will conflict.
+
+**Install to a fixed path** (launchd does not use your shell `PATH` for `uv run`):
+
+```bash
+export REPO_DIR="$HOME/src/deepseek-cursor-proxy"   # pick a stable location
+git clone https://github.com/yxlao/deepseek-cursor-proxy.git "$REPO_DIR"
+cd "$REPO_DIR"
+uv sync
+# Binary used by the service:
+#   $REPO_DIR/.venv/bin/deepseek-cursor-proxy
+```
+
+**Create the LaunchDaemon plist** from the repo template:
+
+```bash
+cp deploy/com.deepseek-cursor-proxy.plist.example ~/com.deepseek-cursor-proxy.plist
+```
+
+Edit `~/com.deepseek-cursor-proxy.plist`:
+
+- Replace `YOUR_USER` with your macOS short username (`whoami`).
+- Set `ProgramArguments` to `$REPO_DIR/.venv/bin/deepseek-cursor-proxy` (absolute path).
+- Confirm log paths under `/Users/YOUR_USER/Library/Logs/deepseek-cursor-proxy/`.
+
+**Enable the service:**
+
+```bash
+mkdir -p ~/Library/Logs/deepseek-cursor-proxy
+
+sudo cp ~/com.deepseek-cursor-proxy.plist /Library/LaunchDaemons/com.deepseek-cursor-proxy.plist
+sudo chown root:wheel /Library/LaunchDaemons/com.deepseek-cursor-proxy.plist
+sudo chmod 644 /Library/LaunchDaemons/com.deepseek-cursor-proxy.plist
+
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.deepseek-cursor-proxy.plist
+sudo launchctl enable system/com.deepseek-cursor-proxy
+sudo launchctl kickstart -k system/com.deepseek-cursor-proxy
+```
+
+**Verify:**
+
+```bash
+sudo launchctl print system/com.deepseek-cursor-proxy
+tail -f ~/Library/Logs/deepseek-cursor-proxy/stderr.log
+curl -sS -H "Authorization: Bearer <your-openrouter-api-key>" "https://proxy.yourdomain.com/v1/healthz"
+```
+
+**Stop or remove the service** (maintenance):
+
+```bash
+sudo launchctl bootout system /Library/LaunchDaemons/com.deepseek-cursor-proxy.plist
+sudo rm /Library/LaunchDaemons/com.deepseek-cursor-proxy.plist
+```
+
+**Updates** after `git pull`:
+
+```bash
+cd "$REPO_DIR" && uv sync
+sudo launchctl kickstart -k system/com.deepseek-cursor-proxy
+```
+
+**Config changes** — edit `~/.deepseek-cursor-proxy/config.yaml`, then `kickstart` (no plist edit unless you change bind `port` or `REPO_DIR`).
+
+**Troubleshooting:**
+
+- `cloudflared is not installed or is not on PATH` — ensure `PATH` in the plist includes `/opt/homebrew/bin` (Apple Silicon) or `/usr/local/bin` (Intel Homebrew).
+- Tunnel auth errors — run `cloudflared tunnel login` as `YOUR_USER`, not as root.
+- Service exits immediately — check `stderr.log`; confirm `proxy_api_key_hash` and `tunnel_url` in config.
+
+The daemon runs as your user (not root) so Cloudflare credentials stay in your home directory. See [SECURITY.md](SECURITY.md) for the threat model.
+
+If you prefer the proxy to start only **after you log in**, use a LaunchAgent in `~/Library/LaunchAgents/` instead of a LaunchDaemon; boot-before-login requires the daemon approach above.
+
+### Step 3: Add the Cursor custom model
+
+In Cursor → Models → Add custom model:
+
+| Field | Value |
+|-------|--------|
+| Model | `deepseek-v4-pro` |
+| API Key | Your [OpenRouter](https://openrouter.ai/settings/keys) key (same key you hashed above) |
+| Base URL | `https://proxy.yourdomain.com/v1` (your tunnel host + `/v1`) |
+
+The proxy maps `deepseek-v4-pro` → OpenRouter `deepseek/deepseek-v4-pro` with xhigh reasoning and DeepSeek-only routing. There is no `base_url` or model override in config.
 
 <img src="assets/cursor_config.png" width="600" alt="Cursor settings for DeepSeek through the proxy">
 
-Note: you can toggle the custom API on and off with:
+Toggle the custom API:
 
 - macOS: `Cmd+Shift+0`
 - Windows/Linux: `Ctrl+Shift+0`
 
-### Step 4: Chat with DeepSeek in Cursor
+### Step 4: Use DeepSeek in Cursor
 
-Select `deepseek-v4-pro` in Cursor and use chat or agent mode as usual.
+Select `deepseek-v4-pro` and use chat or agent mode as usual.
 
 <img src="assets/cursor_chat.png" width="480" alt="Chatting with DeepSeek in Cursor">
 
-## How It Works
+## How it works
 
-- **Core fix:** DeepSeek [thinking-mode tool calls](https://api-docs.deepseek.com/guides/thinking_mode#tool-calls) require the complete **multi-round** `reasoning_content` chain to be sent back in later requests. Cursor omits that field, causing a 400 error. The proxy (`Cursor -> ngrok -> proxy -> DeepSeek API`) stores DeepSeek's original `reasoning_content` and patches missing blocks back into outgoing tool-call history.
-- **Multi-conversation isolation:** To avoid collisions across concurrent conversations, the proxy scopes cache keys by a SHA-256 hash of the canonical conversation prefix (roles, content, and tool calls, excluding `reasoning_content`) plus the upstream model, configuration, and an API-key hash. Different threads get different scopes, so reused tool-call IDs do not collide. Byte-identical cloned histories produce identical scopes.
-- **Context caching compatibility:** The proxy preserves compatibility by never injecting synthetic thread IDs, timestamps, or cache-control messages. It restores `reasoning_content` as the exact original string, so repeated prefixes remain intact for [DeepSeek context cache](https://api-docs.deepseek.com/guides/kv_cache). Cache hit rates are logged in the terminal output.
-- **Additional compatibility fixes:** Beyond reasoning repair, the proxy converts legacy `functions`/`function_call` fields to `tools`/`tool_choice`, preserves required and named tool-choice semantics, normalizes `reasoning_effort` aliases, strips mirrored thinking display blocks from assistant content, flattens multi-part content arrays to plain text, and mirrors `reasoning_content` into Cursor-visible Markdown details blocks.
+```text
+Cursor  →  Cloudflare Tunnel  →  proxy  →  OpenRouter  →  DeepSeek provider only
+                                              deepseek/deepseek-v4-pro
+                                              reasoning.effort: xhigh
+```
+
+- **Core fix:** Thinking-mode tool calls require the full multi-round `reasoning_content` chain on later turns. Cursor drops it → 400. The proxy stores reasoning from responses (OpenRouter’s `reasoning` field is normalized to `reasoning_content`) and patches missing blocks before forwarding.
+- **Cache scopes:** Keys combine a hash of the conversation prefix (roles, content, tool calls — not `reasoning_content`), upstream model, fixed reasoning settings, and API-key hash so parallel chats do not collide.
+- **Context caching:** No synthetic thread IDs or timestamps; restored `reasoning_content` is the exact upstream string.
+- **Other shims:** `functions`/`function_call` → `tools`/`tool_choice`, strip mirrored thinking blocks from assistant content, flatten multipart content, mirror reasoning into Cursor details blocks.
+- **Recovery:** If reasoning is still missing after cache repair, history is truncated to the latest user turn (plus leading system messages) and a short recovery notice is prepended.
 
 ## Development
 
-Run unit tests:
+See [SECURITY.md](SECURITY.md) for the project’s personal-use threat model and lightweight repo hygiene.
+
+Unit tests (proxy uses `--local`):
 
 ```bash
 uv run python -m unittest discover -s tests
 ```
 
-Run pre-commit hooks (code formatting and linting):
+Pre-commit:
 
 ```bash
 uv sync --dev
 uv run pre-commit run --all-files
 ```
 
+### Smoke tests (OpenRouter, manual only)
+
+Hits the real OpenRouter API and bills usage. Not part of CI or the default unit suite.
+
+```bash
+export RUN_LIVE_OPENROUTER_TESTS=1
+export LIVE_OPENROUTER_KEY=sk-or-...   # or OPENROUTER_API_KEY
+uv run python -m tests.smoke
+```
+
+Uses `sha256(your_key)` as `proxy_api_key_hash`, matching production. Covers auth, wrong-bearer rejection, a short completion, and the tool-call reasoning repair loop.
+
 ## Debugging
 
-Run with verbose output:
-
 ```bash
-deepseek-cursor-proxy --verbose
+deepseek-cursor-proxy --local --verbose --trace-dir ./trace-dumps
 ```
 
-Run without ngrok for local curl testing:
-
-```bash
-deepseek-cursor-proxy --no-ngrok --port 9000 --verbose
-```
-
-Capture full structured request traces for debugging:
-
-```bash
-deepseek-cursor-proxy --verbose --trace-dir ./trace-dumps
-```
-
-Use another config file:
-
-```bash
-deepseek-cursor-proxy --config ./dev.config.yaml
-```
-
-Clear the local reasoning cache:
+Clear the reasoning cache:
 
 ```bash
 deepseek-cursor-proxy --clear-reasoning-cache
+```
+
+Alternate config path (local dev only — copy from [`config.example.yaml`](config.example.yaml); avoid committing real hashes to the repo):
+
+```bash
+cp config.example.yaml dev.config.yaml
+# edit dev.config.yaml with your hash and tunnel_url
+deepseek-cursor-proxy --config ./dev.config.yaml
 ```

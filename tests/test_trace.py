@@ -4,10 +4,10 @@ through the proxy (captures real request flow on disk)."""
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import json
 from pathlib import Path
 import stat
-import threading
 from tempfile import TemporaryDirectory
 import time
 import unittest
@@ -18,6 +18,7 @@ from deepseek_cursor_proxy.config import ProxyConfig
 from deepseek_cursor_proxy.reasoning_store import ReasoningStore
 from deepseek_cursor_proxy.server import DeepSeekProxyHandler, DeepSeekProxyServer
 from deepseek_cursor_proxy.trace import TraceWriter
+from tests.support.fixtures import HttpServerFixture, TEST_API_KEY, TEST_API_KEY_HASH
 
 
 class TraceWriterUnitTests(unittest.TestCase):
@@ -43,11 +44,49 @@ class TraceWriterUnitTests(unittest.TestCase):
             self.assertTrue((writer.session_dir / "request-000001.json").exists())
             self.assertTrue((writer.session_dir / "request-000002.json").exists())
             self.assertEqual(
-                stat.S_IMODE(
-                    (writer.session_dir / "request-000001.json").stat().st_mode
-                ),
+                stat.S_IMODE((writer.session_dir / "request-000001.json").stat().st_mode),
                 0o600,
             )
+
+    def test_sanitize_trace_omits_response_and_stream_bodies(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            writer = TraceWriter(temp_dir, sanitize_trace=True)
+            trace = writer.start_request(
+                method="POST",
+                path="/v1/chat/completions",
+                client_address="127.0.0.1",
+                headers={},
+            )
+            trace.record_upstream_response(
+                status=200,
+                body=b'{"choices":[]}',
+            )
+            trace.record_cursor_response(status=200, body=b'{"ok":true}')
+            trace.record_stream_chunk(b"data: {}\n", b"data: {}\n")
+            trace.finish("completed", http_status=200)
+            payload = json.loads(trace.path.read_text(encoding="utf-8"))
+            self.assertNotIn("choices", json.dumps(payload))
+            self.assertEqual(payload["upstream"]["response"]["body_bytes"], len(b'{"choices":[]}'))
+            self.assertIn("upstream_bytes", payload["upstream"]["stream"]["chunks"][0])
+
+    def test_sanitized_response_hashes_use_raw_bytes(self) -> None:
+        body = b"\xff"
+        with TemporaryDirectory() as temp_dir:
+            writer = TraceWriter(temp_dir, sanitize_trace=True)
+            trace = writer.start_request(
+                method="POST",
+                path="/v1/chat/completions",
+                client_address="127.0.0.1",
+                headers={},
+            )
+            trace.record_upstream_response(status=200, body=body)
+            trace.record_cursor_response(status=200, body=body)
+            trace.finish("completed", http_status=200)
+            payload = json.loads(trace.path.read_text(encoding="utf-8"))
+
+        expected = hashlib.sha256(body).hexdigest()
+        self.assertEqual(payload["upstream"]["response"]["body_sha256"], expected)
+        self.assertEqual(payload["cursor_response"]["body_sha256"], expected)
 
     def test_authorization_header_is_redacted(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -62,10 +101,65 @@ class TraceWriterUnitTests(unittest.TestCase):
             serialized = trace.path.read_text(encoding="utf-8")
             self.assertNotIn("sk-secret", serialized)
             payload = json.loads(serialized)
-            self.assertEqual(
-                payload["request"]["headers"]["Authorization"]["present"], True
-            )
+            self.assertEqual(payload["request"]["headers"]["Authorization"]["present"], True)
             self.assertIn("sha256", payload["request"]["headers"]["Authorization"])
+
+
+class RecordCursorBodyBytesTests(unittest.TestCase):
+    def _trace_payload(self, body: bytes, *, sanitize_trace: bool) -> dict[str, object]:
+        with TemporaryDirectory() as temp_dir:
+            writer = TraceWriter(temp_dir, sanitize_trace=sanitize_trace)
+            trace = writer.start_request(
+                method="POST",
+                path="/v1/chat/completions",
+                client_address="127.0.0.1",
+                headers={},
+            )
+            trace.record_cursor_body_bytes(body)
+            trace.finish("completed", http_status=200)
+            return json.loads(trace.path.read_text(encoding="utf-8"))
+
+    def test_sanitize_trace_omits_body_for_invalid_json(self) -> None:
+        payload = self._trace_payload(b"not json", sanitize_trace=True)
+        self.assertEqual(payload["request"]["body_bytes"], len(b"not json"))
+        self.assertNotIn("body", payload["request"])
+        self.assertEqual(payload["request"]["body_omitted"]["reason"], "non_json")
+        self.assertIn("body_sha256", payload["request"])
+
+    def test_sanitize_trace_omits_body_for_non_dict_json(self) -> None:
+        payload = self._trace_payload(b"[1,2,3]", sanitize_trace=True)
+        self.assertEqual(payload["request"]["body_bytes"], len(b"[1,2,3]"))
+        self.assertNotIn("body", payload["request"])
+        self.assertEqual(payload["request"]["body_omitted"]["reason"], "non_object")
+        self.assertIn("body_sha256", payload["request"])
+
+    def test_unsanitized_trace_records_body_for_invalid_json(self) -> None:
+        payload = self._trace_payload(b"not json", sanitize_trace=False)
+        self.assertEqual(payload["request"]["body"], {"text": "not json"})
+
+    def test_unsanitized_trace_records_body_for_non_dict_json(self) -> None:
+        payload = self._trace_payload(b"[1,2,3]", sanitize_trace=False)
+        self.assertEqual(payload["request"]["body"], {"text": "[1,2,3]"})
+
+    def test_sanitize_trace_keeps_summary_for_valid_dict_json(self) -> None:
+        secret = "super-secret-prompt-text"
+        body = json.dumps(
+            {
+                "model": "deepseek-v4-pro",
+                "messages": [{"role": "user", "content": secret}],
+            }
+        ).encode("utf-8")
+        payload = self._trace_payload(body, sanitize_trace=True)
+        serialized = json.dumps(payload)
+        self.assertEqual(payload["request"]["body_bytes"], len(body))
+        self.assertNotIn("body", payload["request"])
+        self.assertIn("body_sha256", payload["request"])
+        self.assertNotIn(secret, serialized)
+        self.assertEqual(payload["request"]["summary"]["model"], "deepseek-v4-pro")
+        self.assertEqual(
+            payload["request"]["summary"]["messages"][0]["content"]["length"],
+            len(secret),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -144,23 +238,6 @@ class _CannedUpstream(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-class _Fixture:
-    def __init__(self, server: ThreadingHTTPServer) -> None:
-        self.server = server
-        self.thread = threading.Thread(target=server.serve_forever, daemon=True)
-        self.thread.start()
-
-    @property
-    def url(self) -> str:
-        host, port = self.server.server_address
-        return f"http://{host}:{port}"
-
-    def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
-
-
 def _read_single_trace(session_dir: Path) -> dict:
     deadline = time.monotonic() + 2
     files = sorted(session_dir.glob("request-*.json"))
@@ -175,19 +252,18 @@ def _read_single_trace(session_dir: Path) -> dict:
 class TraceIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         _CannedUpstream.requests = []
-        self.upstream = _Fixture(ThreadingHTTPServer(("127.0.0.1", 0), _CannedUpstream))
+        self.upstream = HttpServerFixture(ThreadingHTTPServer(("127.0.0.1", 0), _CannedUpstream))
         self.store = ReasoningStore(":memory:")
         self.temp_dir = TemporaryDirectory()
-        self.writer = TraceWriter(self.temp_dir.name)
+        self.writer = TraceWriter(self.temp_dir.name, sanitize_trace=True)
         proxy = DeepSeekProxyServer(("127.0.0.1", 0), DeepSeekProxyHandler)
         proxy.config = ProxyConfig(
             upstream_base_url=self.upstream.url,
-            upstream_model="deepseek-v4-pro",
-            ngrok=False,
+            proxy_api_key_hash=TEST_API_KEY_HASH,
         )
         proxy.reasoning_store = self.store
         proxy.trace_writer = self.writer
-        self.proxy = _Fixture(proxy)
+        self.proxy = HttpServerFixture(proxy)
 
     def tearDown(self) -> None:
         self.proxy.close()
@@ -201,12 +277,44 @@ class TraceIntegrationTests(unittest.TestCase):
             data=json.dumps(payload).encode("utf-8"),
             method="POST",
             headers={
-                "Authorization": "Bearer sk-from-cursor",
+                "Authorization": f"Bearer {TEST_API_KEY}",
                 "Content-Type": "application/json",
             },
         )
         with urlopen(request, timeout=5) as response:
             return json.loads(response.read())
+
+    def test_rejected_invalid_bearer_trace_omits_prompt_text(self) -> None:
+        secret = "do-not-persist-this-prompt"
+        request = Request(
+            f"{self.proxy.url}/v1/chat/completions",
+            data=json.dumps(
+                {
+                    "model": "deepseek-v4-pro",
+                    "messages": [{"role": "user", "content": secret}],
+                }
+            ).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": "Bearer wrong-key",
+                "Content-Type": "application/json",
+            },
+        )
+        with self.assertRaises(HTTPError) as captured:
+            urlopen(request, timeout=5)
+        self.assertEqual(captured.exception.code, 401)
+        captured.exception.read()
+
+        trace = _read_single_trace(self.writer.session_dir)
+        serialized = json.dumps(trace)
+        self.assertEqual(trace["completion"]["status"], "rejected")
+        self.assertEqual(trace["completion"]["http_status"], 401)
+        self.assertNotIn("body", trace["request"])
+        self.assertNotIn(secret, serialized)
+        self.assertEqual(
+            trace["request"]["summary"]["messages"][0]["content"]["length"],
+            len(secret),
+        )
 
     def test_traces_unsupported_post_path_with_body(self) -> None:
         request = Request(
@@ -219,7 +327,7 @@ class TraceIntegrationTests(unittest.TestCase):
             ).encode("utf-8"),
             method="POST",
             headers={
-                "Authorization": "Bearer sk-from-cursor",
+                "Authorization": f"Bearer {TEST_API_KEY}",
                 "Content-Type": "application/json",
             },
         )
@@ -231,7 +339,7 @@ class TraceIntegrationTests(unittest.TestCase):
         trace = _read_single_trace(self.writer.session_dir)
         self.assertEqual(trace["request"]["method"], "POST")
         self.assertEqual(trace["request"]["path"], "/v1/summarize")
-        self.assertEqual(trace["request"]["body"]["model"], "gpt-4o-mini")
+        self.assertNotIn("body", trace["request"])
         self.assertEqual(trace["request"]["summary"]["model"], "gpt-4o-mini")
         self.assertEqual(trace["completion"]["status"], "rejected")
         self.assertEqual(trace["completion"]["http_status"], 404)
@@ -248,17 +356,11 @@ class TraceIntegrationTests(unittest.TestCase):
         trace = _read_single_trace(self.writer.session_dir)
         serialized = json.dumps(trace)
         self.assertEqual(trace["completion"]["status"], "completed")
-        self.assertEqual(
-            trace["request"]["body"]["messages"][0]["content"],
-            "What is tomorrow's date?",
-        )
-        self.assertEqual(
-            trace["upstream"]["response"]["body"]["json"]["choices"][0]["message"][
-                "reasoning_content"
-            ],
-            "I need the date.",
-        )
-        self.assertNotIn("sk-from-cursor", serialized)
+        self.assertNotIn("body", trace["request"])
+        self.assertEqual(trace["request"]["summary"]["messages"][0]["content"]["length"], 24)
+        self.assertIn("body_sha256", trace["upstream"]["response"])
+        self.assertNotIn("choices", serialized)
+        self.assertNotIn(TEST_API_KEY, serialized)
 
     def test_captures_streaming_replay_chunks(self) -> None:
         request = Request(
@@ -280,13 +382,8 @@ class TraceIntegrationTests(unittest.TestCase):
             response.read()
         trace = _read_single_trace(self.writer.session_dir)
         self.assertEqual(trace["completion"]["status"], "completed")
-        self.assertIn(
-            "reasoning_content",
-            trace["upstream"]["stream"]["chunks"][0]["line"],
-        )
-        self.assertIn(
-            "<details>", trace["cursor_response"]["stream"]["chunks"][0]["line"]
-        )
+        self.assertGreater(trace["upstream"]["stream"]["chunks"][0]["upstream_bytes"], 0)
+        self.assertGreater(trace["upstream"]["stream"]["chunks"][0]["cursor_bytes"], 0)
 
     def test_captures_recovery_diagnostics(self) -> None:
         """A request that triggers cold-cache recovery records the recovery
@@ -313,17 +410,9 @@ class TraceIntegrationTests(unittest.TestCase):
             }
         )
         trace = _read_single_trace(self.writer.session_dir)
-        self.assertEqual(
-            trace["transform"]["recovery_steps"][0]["strategy"], "latest_user"
-        )
+        self.assertEqual(trace["transform"]["recovery_steps"][0]["strategy"], "latest_user")
         self.assertGreaterEqual(
-            len(
-                [
-                    item
-                    for item in trace["transform"]["reasoning_diagnostics"]
-                    if item["missing"]
-                ]
-            ),
+            len([item for item in trace["transform"]["reasoning_diagnostics"] if item["missing"]]),
             1,
         )
 

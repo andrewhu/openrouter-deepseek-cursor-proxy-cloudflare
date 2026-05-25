@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from deepseek_cursor_proxy.config import ProxyConfig
+from deepseek_cursor_proxy.config import OPENROUTER_MODEL_ID, ProxyConfig
 from deepseek_cursor_proxy.reasoning_store import (
     ReasoningStore,
     conversation_scope,
@@ -21,7 +21,6 @@ from deepseek_cursor_proxy.transform import (
     RECOVERY_NOTICE_CONTENT,
     RECOVERY_NOTICE_TEXT,
     extract_text_content,
-    normalize_reasoning_effort,
     prepare_upstream_request,
     reasoning_cache_namespace,
     rewrite_response_body,
@@ -31,12 +30,8 @@ from deepseek_cursor_proxy.transform import (
 
 
 def _default_cache_namespace() -> str:
-    return reasoning_cache_namespace(
-        ProxyConfig(),
-        "deepseek-v4-pro",
-        {"type": "enabled"},
-        "max",
-    )
+    config = ProxyConfig()
+    return reasoning_cache_namespace(config, OPENROUTER_MODEL_ID)
 
 
 def _cache_scope(messages: list[dict]) -> str:
@@ -61,9 +56,7 @@ class ContentHelpersTests(unittest.TestCase):
 
     def test_strip_cursor_thinking_blocks_removes_details_and_think(self) -> None:
         self.assertEqual(
-            strip_cursor_thinking_blocks(
-                "<details>\n<summary>Thinking</summary>\n\nplan\n</details>\n\nanswer"
-            ),
+            strip_cursor_thinking_blocks("<details>\n<summary>Thinking</summary>\n\nplan\n</details>\n\nanswer"),
             "answer",
         )
         self.assertEqual(
@@ -74,14 +67,6 @@ class ContentHelpersTests(unittest.TestCase):
     def test_strip_cursor_thinking_blocks_preserves_unrelated_details(self) -> None:
         kept = "<details><summary>Diff</summary>\nrelevant\n</details>"
         self.assertEqual(strip_cursor_thinking_blocks(kept), kept)
-
-    def test_normalize_reasoning_effort_aliases(self) -> None:
-        self.assertEqual(normalize_reasoning_effort("low"), "high")
-        self.assertEqual(normalize_reasoning_effort("medium"), "high")
-        self.assertEqual(normalize_reasoning_effort("high"), "high")
-        self.assertEqual(normalize_reasoning_effort("max"), "max")
-        self.assertEqual(normalize_reasoning_effort("xhigh"), "max")
-        self.assertEqual(normalize_reasoning_effort("nonsense"), "high")
 
 
 class RequestPreparationTests(unittest.TestCase):
@@ -180,30 +165,29 @@ class RequestPreparationTests(unittest.TestCase):
                     "model": "gpt-4",
                     "messages": [{"role": "user", "content": "hi"}],
                 },
-                ProxyConfig(upstream_model="deepseek-v4-pro"),
+                ProxyConfig(),
                 self.store,
             )
-        self.assertEqual(prepared.payload["model"], "deepseek-v4-pro")
-        self.assertIn("non-DeepSeek", "\n".join(captured.output))
+        self.assertEqual(prepared.payload["model"], OPENROUTER_MODEL_ID)
+        self.assertIn("rewriting model", "\n".join(captured.output))
 
-    def test_thinking_disabled_strips_reasoning_from_assistant_history(self) -> None:
+    def test_openrouter_request_uses_xhigh_reasoning_and_deepseek_provider(self) -> None:
         prepared = prepare_upstream_request(
             {
                 "model": "deepseek-v4-pro",
-                "messages": [
-                    {"role": "user", "content": "hi"},
-                    {
-                        "role": "assistant",
-                        "content": "answer",
-                        "reasoning_content": "should be discarded",
-                    },
-                ],
+                "messages": [{"role": "user", "content": "hi"}],
             },
-            ProxyConfig(thinking="disabled"),
+            ProxyConfig(),
             self.store,
         )
-        self.assertEqual(prepared.payload["thinking"], {"type": "disabled"})
-        self.assertNotIn("reasoning_content", prepared.payload["messages"][1])
+        self.assertEqual(prepared.payload["model"], OPENROUTER_MODEL_ID)
+        self.assertEqual(prepared.payload["reasoning"], {"effort": "xhigh"})
+        self.assertEqual(
+            prepared.payload["provider"],
+            {"only": ["deepseek"], "allow_fallbacks": False},
+        )
+        self.assertNotIn("thinking", prepared.payload)
+        self.assertNotIn("reasoning_effort", prepared.payload)
 
     def test_plain_chat_history_does_not_require_reasoning(self) -> None:
         prepared = prepare_upstream_request(
@@ -282,16 +266,42 @@ class ResponseRewriteTests(unittest.TestCase):
             }
         ).encode()
         request_messages = [{"role": "user", "content": "hi"}]
-        rewritten = rewrite_response_body(
-            body, "deepseek-v4-pro", self.store, request_messages
-        )
+        rewritten = rewrite_response_body(body, "deepseek-v4-pro", self.store, request_messages)
         payload = json.loads(rewritten)
         self.assertEqual(payload["model"], "deepseek-v4-pro")
+        assistant_message = {
+            "role": "assistant",
+            "content": "Final.",
+            "reasoning_content": "Done thinking.",
+        }
         stored = self.store.get(
-            f"scope:{conversation_scope(request_messages)}:signature:"
-            f"{message_signature(payload['choices'][0]['message'])}"
+            f"scope:{conversation_scope(request_messages)}:signature:" f"{message_signature(assistant_message)}"
         )
         self.assertEqual(stored, "Done thinking.")
+
+    def test_maps_openrouter_reasoning_field_to_reasoning_content(self) -> None:
+        body = json.dumps(
+            {
+                "id": "chatcmpl",
+                "object": "chat.completion",
+                "model": OPENROUTER_MODEL_ID,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "Final.",
+                            "reasoning": "Done thinking.",
+                        },
+                    }
+                ],
+            }
+        ).encode()
+        request_messages = [{"role": "user", "content": "hi"}]
+        rewritten = rewrite_response_body(body, "deepseek-v4-pro", self.store, request_messages)
+        message = json.loads(rewritten)["choices"][0]["message"]
+        self.assertEqual(message["reasoning_content"], "Done thinking.")
 
     def test_recovery_notice_is_prefixed_into_response_content(self) -> None:
         body = json.dumps(
@@ -364,16 +374,12 @@ class CrossModeAndModelTests(unittest.TestCase):
         config = ProxyConfig()
         namespace_pro = reasoning_cache_namespace(
             config,
-            "deepseek-v4-pro",
-            {"type": "enabled"},
-            "max",
+            OPENROUTER_MODEL_ID,
             "Bearer key-a",
         )
         namespace_flash = reasoning_cache_namespace(
             config,
             "deepseek-v4-flash",
-            {"type": "enabled"},
-            "max",
             "Bearer key-a",
         )
         self.assertEqual(namespace_pro, namespace_flash)
@@ -479,11 +485,7 @@ class CrossModeAndModelTests(unittest.TestCase):
             portable_prepared.payload["messages"][3]["reasoning_content"],
             "Need README before answering.",
         )
-        self.assertTrue(
-            str(portable_prepared.reasoning_diagnostics[-1]["hit_kind"]).startswith(
-                "portable_"
-            )
-        )
+        self.assertTrue(str(portable_prepared.reasoning_diagnostics[-1]["hit_kind"]).startswith("portable_"))
 
     def test_portable_turn_cache_restores_final_assistant_after_tool_result(
         self,
@@ -541,7 +543,7 @@ class CrossModeAndModelTests(unittest.TestCase):
                     {"role": "user", "content": "continue"},
                 ],
             },
-            ProxyConfig(missing_reasoning_strategy="reject"),
+            ProxyConfig(),
             self.store,
         )
 
@@ -637,7 +639,7 @@ class CrossModeAndModelTests(unittest.TestCase):
         }
         first_recovered = prepare_upstream_request(
             first_payload,
-            ProxyConfig(missing_reasoning_strategy="recover"),
+            ProxyConfig(),
             self.store,
         )
         self.assertEqual(first_recovered.recovered_reasoning_messages, 1)
@@ -672,6 +674,14 @@ class CrossModeAndModelTests(unittest.TestCase):
             recording_contexts=first_recovered.record_response_contexts,
         )
         recovered_assistant = json.loads(rewritten)["choices"][0]["message"]
+        self.assertIn("<summary>Thinking</summary>", recovered_assistant["content"])
+        self.assertIn(first_recovered.recovery_notice, recovered_assistant["content"])
+        stored_assistant = {
+            "role": "assistant",
+            "content": first_recovered.recovery_notice or "",
+            "reasoning_content": "Need the new lookup.",
+            "tool_calls": [new_tool_call],
+        }
 
         # Reasoning must be recorded under BOTH scopes — pre-recovery (so
         # subsequent Cursor requests echoing the with-prefix history hit) and
@@ -679,12 +689,16 @@ class CrossModeAndModelTests(unittest.TestCase):
         self.assertEqual(len(first_recovered.record_response_contexts), 2)
         for scope, _messages in first_recovered.record_response_contexts:
             self.assertEqual(
-                self.store.get(
-                    f"scope:{scope}:signature:{message_signature(recovered_assistant)}"
-                ),
+                self.store.get(f"scope:{scope}:signature:{message_signature(stored_assistant)}"),
                 "Need the new lookup.",
             )
-        recovered_assistant.pop("reasoning_content", None)
+        # Cursor echoes the assistant turn without reasoning_content and
+        # without the proxy's folded <details> display block.
+        cursor_echo_assistant = {
+            "role": "assistant",
+            "content": first_recovered.recovery_notice or "",
+            "tool_calls": [new_tool_call],
+        }
 
         # Cursor's next request echoes the recovered assistant + tool result.
         # The proxy should detect the recovery boundary, retire the prefix,
@@ -693,14 +707,14 @@ class CrossModeAndModelTests(unittest.TestCase):
             "model": "deepseek-v4-pro",
             "messages": [
                 *first_payload["messages"],
-                recovered_assistant,
+                cursor_echo_assistant,
                 {"role": "tool", "tool_call_id": "call_new", "content": "new result"},
             ],
         }
 
         second_prepared = prepare_upstream_request(
             second_payload,
-            ProxyConfig(missing_reasoning_strategy="recover"),
+            ProxyConfig(),
             self.store,
         )
 
@@ -738,7 +752,7 @@ class StopMidStreamingToolCallTests(unittest.TestCase):
         }
         first_prepared = prepare_upstream_request(
             first_payload,
-            ProxyConfig(missing_reasoning_strategy="recover"),
+            ProxyConfig(),
             self.store,
         )
 
@@ -805,7 +819,7 @@ class StopMidStreamingToolCallTests(unittest.TestCase):
         }
         second_prepared = prepare_upstream_request(
             second_payload,
-            ProxyConfig(missing_reasoning_strategy="recover"),
+            ProxyConfig(),
             self.store,
         )
 
@@ -817,12 +831,106 @@ class StopMidStreamingToolCallTests(unittest.TestCase):
             "Need to grep.",
         )
 
+    def test_same_turn_duplicate_tool_names_get_distinct_cache_keys(self) -> None:
+        store = ReasoningStore(":memory:")
+        config = ProxyConfig()
+        payload = {
+            "model": "deepseek-v4-pro",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "u1"},
+            ],
+        }
+        prepared = prepare_upstream_request(payload, config, store)
+        response = {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "First grep reasoning.",
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "grep_search",
+                                    "arguments": '{"q":"alpha"}',
+                                },
+                            },
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "grep_search",
+                                    "arguments": '{"q":"beta"}',
+                                },
+                            },
+                        ],
+                    },
+                }
+            ]
+        }
+        rewrite_response_body(
+            json.dumps(response).encode("utf-8"),
+            original_model=prepared.original_model,
+            store=store,
+            request_messages=prepared.record_response_messages,
+            cache_namespace=prepared.cache_namespace,
+            scope=prepared.record_response_scope,
+            prior_messages=prepared.record_response_messages,
+            recording_contexts=prepared.record_response_contexts,
+        )
+
+        second_payload = {
+            "model": "deepseek-v4-pro",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "u1"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-0",
+                            "type": "function",
+                            "function": {
+                                "name": "grep_search",
+                                "arguments": '{"q":"alpha"}',
+                            },
+                        },
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "grep_search",
+                                "arguments": '{"q":"beta"}',
+                            },
+                        },
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-0",
+                    "content": "alpha hits",
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": "beta hits",
+                },
+                {"role": "user", "content": "u2"},
+            ],
+        }
+        second_prepared = prepare_upstream_request(second_payload, config, store)
+        assistant = second_prepared.payload["messages"][2]
+        self.assertEqual(assistant.get("reasoning_content"), "First grep reasoning.")
+
     def test_tool_name_keys_are_isolated_across_distinct_turns(self) -> None:
         # Two separate turns each interrupt with the same function name.
         # The strict scope already differs (each turn has more prior
         # messages) so the two cached entries should not collide and the
         # second turn's reasoning must not leak into the first turn's slot.
-        config = ProxyConfig(missing_reasoning_strategy="recover")
+        config = ProxyConfig()
 
         def cache_partial(payload: dict, reasoning: str, args_fragment: str) -> dict:
             prepared = prepare_upstream_request(payload, config, self.store)

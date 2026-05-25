@@ -3,22 +3,36 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, replace
 import gzip
+import secrets
 from http.client import HTTPException
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
+import threading
 import time
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+import urllib3
 import zlib
 
 from .config import (
+    CURSOR_MODEL_ID,
+    DEFAULT_MAX_CONCURRENT_REQUESTS,
+    DEFAULT_MAX_REQUEST_BODY_BYTES,
+    DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS,
+    DEFAULT_REASONING_CACHE_MAX_ROWS,
+    DEFAULT_REQUEST_QUEUE_SIZE,
+    DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_TUNNEL_NAME,
+    DEFAULT_UPSTREAM_BASE_URL,
+    OPENROUTER_MODEL_ID,
+    REASONING_EFFORT,
     ProxyConfig,
     default_config_path,
     default_reasoning_content_path,
+    is_loopback_host,
+    validate_proxy_api_key_hash,
 )
 from .logging import (
     LOG,
@@ -27,10 +41,11 @@ from .logging import (
 )
 from .reasoning_store import ReasoningStore, conversation_scope
 from .streaming import CursorReasoningDisplayAdapter, StreamAccumulator
-from .trace import TraceRequest, TraceWriter
-from .tunnel import NgrokTunnel, local_tunnel_target
+from .trace import TraceRequest, TraceWriter, sha256_text
+from .tunnel import CloudflareTunnel, HEALTH_PATHS, local_tunnel_target
 from .transform import (
     RECOVERY_NOTICE_CONTENT,
+    normalize_upstream_reasoning_fields,
     prepare_upstream_request,
     rewrite_response_body,
 )
@@ -40,16 +55,68 @@ class RequestBodyTooLarge(ValueError):
     pass
 
 
+THREAD_DRAIN_SECONDS = 0.5
+
+_UPSTREAM_POOL = urllib3.PoolManager(
+    num_pools=4,
+    maxsize=8,
+    block=True,
+    retries=0,
+)
+
+
+def _parse_bearer_token(auth_header: str) -> str | None:
+    scheme, separator, token = auth_header.strip().partition(" ")
+    if separator != " " or scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
 @dataclass
 class ProxyResponseResult:
     sent: bool
     usage: dict[str, Any] | None = None
 
 
-class DeepSeekProxyServer(ThreadingHTTPServer):
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a bounded number of concurrent request threads."""
+
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        RequestHandlerClass: type[BaseHTTPRequestHandler],
+        *,
+        max_concurrent_requests: int = 32,
+    ) -> None:
+        self._request_semaphore = threading.Semaphore(max_concurrent_requests)
+        super().__init__(server_address, RequestHandlerClass)
+
+    def process_request(self, request: Any, client_address: tuple[str, int]) -> None:
+        self._request_semaphore.acquire()
+        thread = threading.Thread(
+            target=self._process_request_thread_release,
+            args=(request, client_address),
+            daemon=self.daemon_threads,
+        )
+        thread.start()
+
+    def _process_request_thread_release(self, request: Any, client_address: tuple[str, int]) -> None:
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            self._request_semaphore.release()
+
+
+TUNNEL_DOWN_MESSAGE = "Cloudflare tunnel is down; restart deepseek-cursor-proxy"
+
+
+class DeepSeekProxyServer(BoundedThreadingHTTPServer):
     config: ProxyConfig
     reasoning_store: ReasoningStore
     trace_writer: TraceWriter | None
+    tunnel: CloudflareTunnel | None = None
 
 
 class DeepSeekProxyHandler(BaseHTTPRequestHandler):
@@ -67,6 +134,10 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
     def trace_writer(self) -> TraceWriter | None:
         return getattr(self.server, "trace_writer", None)
 
+    @property
+    def tunnel(self) -> CloudflareTunnel | None:
+        return getattr(self.server, "tunnel", None)
+
     def log_message(self, fmt: str, *args: Any) -> None:
         return
 
@@ -78,19 +149,68 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 request_path,
                 self.client_address[0],
             )
-        self._send_response_headers(204, [], "sending CORS preflight response")
+        self._send_response_headers(204, [], "sending OPTIONS preflight response")
 
     def do_GET(self) -> None:
         request_path = urlparse(self.path).path
         if self.config.verbose:
             LOG.info("incoming GET %s from %s", request_path, self.client_address[0])
-        if request_path in {"/healthz", "/v1/healthz"}:
+        if request_path in HEALTH_PATHS or request_path in {
+            "/models",
+            "/v1/models",
+        }:
+            if not self._authorize_discovery_request():
+                return
+        if request_path in HEALTH_PATHS:
             self._send_json(200, {"ok": True})
             return
         if request_path in {"/models", "/v1/models"}:
+            if self._reject_if_tunnel_dead():
+                return
             self._send_models()
             return
         self._send_json(404, {"error": {"message": "Not found"}})
+
+    def _reject_if_tunnel_dead(
+        self,
+        *,
+        trace: TraceRequest | None = None,
+        request_path: str | None = None,
+    ) -> bool:
+        tunnel = self.tunnel
+        if tunnel is None or not tunnel.dead:
+            return False
+        if request_path is not None:
+            LOG.warning(
+                "rejected request path=%s status=503 reason=tunnel_dead tunnel_url=%s",
+                request_path,
+                tunnel.tunnel_url,
+            )
+        self._send_json(
+            503,
+            {"error": {"message": TUNNEL_DOWN_MESSAGE}},
+            trace=trace,
+        )
+        if trace is not None:
+            self._finish_trace(trace, "rejected", http_status=503, reason="tunnel_dead")
+        return True
+
+    def _authorize_discovery_request(self) -> bool:
+        """Require proxy bearer on discovery endpoints."""
+        authorization = self._cursor_authorization()
+        if authorization is None:
+            self._send_json(
+                401,
+                {"error": {"message": "Missing Authorization bearer token"}},
+            )
+            return False
+        if not self._authorize_bearer_token(authorization):
+            self._send_json(
+                401,
+                {"error": {"message": "Invalid Authorization bearer token"}},
+            )
+            return False
+        return True
 
     def do_POST(self) -> None:
         started = time.monotonic()
@@ -129,19 +249,30 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             self._finish_trace(trace, "rejected", http_status=401)
             return
 
+        if not self._authorize_bearer_token(cursor_authorization):
+            LOG.warning(
+                "rejected request path=%s status=401 reason=invalid_bearer_token",
+                request_path,
+            )
+            self._record_request_body_for_trace(trace)
+            self._send_json(
+                401,
+                {"error": {"message": "Invalid Authorization bearer token"}},
+                trace=trace,
+            )
+            self._finish_trace(trace, "rejected", http_status=401)
+            return
+        if self._reject_if_tunnel_dead(trace=trace, request_path=request_path):
+            return
         try:
             payload = self._read_json_body()
         except RequestBodyTooLarge as exc:
-            LOG.warning(
-                "rejected request path=%s status=413 reason=%s", request_path, exc
-            )
+            LOG.warning("rejected request path=%s status=413 reason=%s", request_path, exc)
             self._send_json(413, {"error": {"message": str(exc)}}, trace=trace)
             self._finish_trace(trace, "rejected", http_status=413, reason=str(exc))
             return
         except ValueError as exc:
-            LOG.warning(
-                "rejected request path=%s status=400 reason=%s", request_path, exc
-            )
+            LOG.warning("rejected request path=%s status=400 reason=%s", request_path, exc)
             self._send_json(400, {"error": {"message": str(exc)}}, trace=trace)
             self._finish_trace(trace, "rejected", http_status=400, reason=str(exc))
             return
@@ -163,42 +294,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if trace is not None:
             trace.record_transform(prepared)
         log_context_summary(prepared)
-        if (
-            prepared.missing_reasoning_messages
-            and self.config.missing_reasoning_strategy == "reject"
-        ):
-            LOG.warning(
-                (
-                    "strict missing-reasoning mode rejected request path=%s "
-                    "status=409 reason=missing_reasoning_content count=%s"
-                ),
-                request_path,
-                prepared.missing_reasoning_messages,
-            )
-            self._send_json(
-                409,
-                {
-                    "error": {
-                        "message": (
-                            "deepseek-cursor-proxy is running in strict "
-                            "missing-reasoning mode and cannot automatically "
-                            "recover this thinking-mode tool-call history because "
-                            "cached DeepSeek reasoning_content is missing for "
-                            f"{prepared.missing_reasoning_messages} assistant "
-                            "message(s). Restart without "
-                            "`--missing-reasoning-strategy reject`, or pass "
-                            "`--missing-reasoning-strategy recover`, so the proxy "
-                            "can recover from partial chat history automatically."
-                        ),
-                        "type": "missing_reasoning_content",
-                        "code": "missing_reasoning_content",
-                        "missing_reasoning_messages": prepared.missing_reasoning_messages,
-                    }
-                },
-                trace=trace,
-            )
-            self._finish_trace(trace, "rejected", http_status=409)
-            return
 
         if self.config.verbose:
             LOG.info(
@@ -216,9 +311,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if self.config.verbose:
             log_json("upstream request body", prepared.payload)
 
-        upstream_body = json.dumps(
-            prepared.payload, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
+        upstream_body = json.dumps(prepared.payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         upstream_url = f"{self.config.upstream_base_url}/chat/completions"
         upstream_headers = self._upstream_headers(
             stream=bool(prepared.payload.get("stream")),
@@ -230,13 +323,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 headers=upstream_headers,
                 body_bytes=upstream_body,
             )
-        request = Request(
-            upstream_url,
-            data=upstream_body,
-            method="POST",
-            headers=upstream_headers,
-        )
-
         if self.config.verbose:
             log_send_summary(prepared)
         spinner = TerminalSpinner(
@@ -247,38 +333,32 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         try:
             if self.config.verbose:
                 LOG.info("forwarding to %s", upstream_url)
-            response = urlopen(request, timeout=self.config.request_timeout)
-        except HTTPError as exc:
-            spinner.stop()
-            LOG.warning(
-                "request failed upstream_status=%s stream=%s elapsed_ms=%s",
-                exc.code,
-                bool(prepared.payload.get("stream")),
-                elapsed_ms(started),
+            response = _UPSTREAM_POOL.request(
+                "POST",
+                upstream_url,
+                body=upstream_body,
+                headers=upstream_headers,
+                timeout=urllib3.Timeout(
+                    connect=DEFAULT_REQUEST_TIMEOUT,
+                    read=DEFAULT_REQUEST_TIMEOUT,
+                ),
+                preload_content=False,
             )
-            self._send_upstream_error(exc, trace=trace)
-            self._finish_trace(
-                trace,
-                "upstream_error",
-                http_status=exc.code,
-                stream=bool(prepared.payload.get("stream")),
-            )
-            return
-        except URLError as exc:
+        except urllib3.exceptions.HTTPError as exc:
             spinner.stop()
             LOG.warning(
                 "upstream request failed elapsed_ms=%s reason=%s",
                 elapsed_ms(started),
-                exc.reason,
+                exc,
             )
             self._send_json(
                 502,
-                {"error": {"message": f"Upstream request failed: {exc.reason}"}},
+                {"error": {"message": f"Upstream request failed: {exc}"}},
                 trace=trace,
             )
             self._finish_trace(trace, "upstream_error", http_status=502)
             return
-        except Exception:
+        except BaseException:
             spinner.stop()
             raise
 
@@ -292,6 +372,16 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                         bool(prepared.payload.get("stream")),
                         elapsed_ms(started),
                     )
+                if upstream_status >= 400:
+                    spinner.stop()
+                    self._forward_upstream_response(response, trace=trace)
+                    self._finish_trace(
+                        trace,
+                        "upstream_error",
+                        http_status=upstream_status,
+                        stream=bool(prepared.payload.get("stream")),
+                    )
+                    return
                 if prepared.payload.get("stream"):
                     sent_response = self._proxy_streaming_response(
                         response,
@@ -365,23 +455,17 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             LOG.warning("failed to write request trace: %s", exc)
 
     def _cursor_authorization(self) -> str | None:
-        auth_header = self.headers.get("Authorization", "")
-        scheme, separator, token = auth_header.strip().partition(" ")
-        if separator != " " or scheme.lower() != "bearer" or not token.strip():
+        token = _parse_bearer_token(self.headers.get("Authorization", ""))
+        if token is None:
             return None
-        return f"Bearer {token.strip()}"
+        return f"Bearer {token}"
 
-    def _send_cors_headers(self) -> None:
-        if not self.config.cors:
-            return
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            "Origin, Content-Type, Accept, Authorization",
-        )
-        self.send_header("Access-Control-Expose-Headers", "Content-Length")
-        self.send_header("Access-Control-Allow-Credentials", "true")
+    def _authorize_bearer_token(self, authorization: str) -> bool:
+        """Validate bearer token against configured proxy_api_key_hash."""
+        token = _parse_bearer_token(authorization)
+        if token is None:
+            return False
+        return secrets.compare_digest(sha256_text(token), self.config.proxy_api_key_hash or "")
 
     def _send_json(
         self,
@@ -390,9 +474,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         *,
         trace: TraceRequest | None = None,
     ) -> None:
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if trace is not None:
             trace.record_cursor_response(
                 status=status,
@@ -421,7 +503,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
     ) -> bool:
         try:
             self.send_response(status)
-            self._send_cors_headers()
             for name, value in headers:
                 self.send_header(name, value)
             self.end_headers()
@@ -447,24 +528,16 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         return True
 
     def _send_models(self) -> None:
+        from .config import CURSOR_MODEL_ID
+
         created = int(time.time())
-        model_ids = list(
-            dict.fromkeys(
-                [
-                    self.config.upstream_model,
-                    "deepseek-v4-pro",
-                    "deepseek-v4-flash",
-                ]
-            )
-        )
         models = [
             {
-                "id": model_id,
+                "id": CURSOR_MODEL_ID,
                 "object": "model",
                 "created": created,
                 "owned_by": "deepseek",
             }
-            for model_id in model_ids
         ]
         self._send_json(200, {"object": "list", "data": models})
 
@@ -475,15 +548,17 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             raise ValueError("Invalid Content-Length") from exc
         if length < 0:
             raise ValueError("Invalid Content-Length")
-        if length > self.config.max_request_body_bytes:
-            raise RequestBodyTooLarge(
-                f"Request body is too large; limit is {self.config.max_request_body_bytes} bytes"
-            )
+        if length > DEFAULT_MAX_REQUEST_BODY_BYTES:
+            raise RequestBodyTooLarge(f"Request body is too large; limit is {DEFAULT_MAX_REQUEST_BODY_BYTES} bytes")
         raw_body = self.rfile.read(length)
         if not raw_body:
             raise ValueError("Request body is empty")
         try:
-            payload = json.loads(raw_body.decode("utf-8"))
+            raw_text = raw_body.decode("utf-8")
+            _check_json_depth(raw_text, max_depth=64)
+            payload = json.loads(raw_text)
+        except RecursionError:
+            raise ValueError("Request body JSON nesting is too deep")
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid JSON: {exc}") from exc
         if not isinstance(payload, dict):
@@ -499,20 +574,16 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             trace.record_cursor_body_omitted(reason="invalid_content_length")
             return
         if length < 0:
-            trace.record_cursor_body_omitted(
-                reason="invalid_content_length", body_bytes=length
-            )
+            trace.record_cursor_body_omitted(reason="invalid_content_length", body_bytes=length)
             return
-        if length > self.config.max_request_body_bytes:
+        if length > DEFAULT_MAX_REQUEST_BODY_BYTES:
             trace.record_cursor_body_omitted(reason="body_too_large", body_bytes=length)
             self.close_connection = True
             return
         try:
             raw_body = self.rfile.read(length)
         except OSError as exc:
-            trace.record_cursor_body_omitted(
-                reason=f"read_failed:{exc}", body_bytes=length
-            )
+            trace.record_cursor_body_omitted(reason=f"read_failed:{exc}", body_bytes=length)
             return
         trace.record_cursor_body_bytes(raw_body)
 
@@ -524,33 +595,40 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             "Accept-Encoding": "identity",
             "User-Agent": self.server_version,
         }
+        if "openrouter.ai" in self.config.upstream_base_url:
+            referer = self.config.tunnel_url or "https://github.com/yxlao/deepseek-cursor-proxy"
+            headers["HTTP-Referer"] = referer
+            headers["X-Title"] = "deepseek-cursor-proxy"
         accept_language = self.headers.get("Accept-Language")
         if accept_language:
             headers["Accept-Language"] = accept_language
         return headers
 
-    def _send_upstream_error(
+    def _forward_upstream_response(
         self,
-        exc: HTTPError,
+        response: Any,
         *,
         trace: TraceRequest | None = None,
     ) -> None:
-        body = read_response_body(exc)
+        body = read_response_body(response)
+        status = getattr(response, "status", 502)
         if self.config.verbose:
             log_bytes("upstream error body", body)
+        content_type = response.headers.get("Content-Type", "application/json")
         headers = {
-            "Content-Type": exc.headers.get("Content-Type", "application/json"),
+            "Content-Type": content_type,
             "Content-Length": str(len(body)),
         }
         if trace is not None:
             trace.record_upstream_response(
-                status=exc.code,
-                headers={name: value for name, value in exc.headers.items()},
+                status=status,
+                headers=response_headers(response),
                 body=body,
+                stream=bool(str(content_type).startswith("text/event-stream")),
             )
-            trace.record_cursor_response(status=exc.code, headers=headers, body=body)
+            trace.record_cursor_response(status=status, headers=headers, body=body)
         sent_headers = self._send_response_headers(
-            exc.code,
+            status,
             [
                 ("Content-Type", headers["Content-Type"]),
                 ("Content-Length", headers["Content-Length"]),
@@ -586,8 +664,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 scope=record_response_scope,
                 prior_messages=record_response_messages,
                 recording_contexts=record_response_contexts,
-                display_reasoning=self.config.display_reasoning,
-                collapsible_reasoning=self.config.collapsible_reasoning,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             LOG.warning("failed to rewrite upstream JSON response: %s", exc)
@@ -672,25 +748,15 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
 
         accumulator = StreamAccumulator()
         usage: dict[str, Any] | None = None
-        display_adapter = (
-            CursorReasoningDisplayAdapter(self.config.collapsible_reasoning)
-            if self.config.display_reasoning
-            else None
-        )
+        display_adapter = CursorReasoningDisplayAdapter(collapsible=True)
         scope = (
             record_response_scope
             if record_response_scope is not None
             else conversation_scope(request_messages, cache_namespace)
         )
-        response_prior_messages = (
-            record_response_messages
-            if record_response_messages is not None
-            else request_messages
-        )
+        response_prior_messages = record_response_messages if record_response_messages is not None else request_messages
         response_contexts = (
-            record_response_contexts
-            if record_response_contexts is not None
-            else [(scope, response_prior_messages)]
+            record_response_contexts if record_response_contexts is not None else [(scope, response_prior_messages)]
         )
         finalized = False
         pending_recovery_notice = recovery_notice
@@ -722,9 +788,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     usage = chunk_usage
                 if trace is not None:
                     trace.record_stream_chunk(line, rewritten)
-                if not self._write_to_client(
-                    rewritten, "sending streaming response chunk", flush=True
-                ):
+                if not self._write_to_client(rewritten, "sending streaming response chunk", flush=True):
                     return ProxyResponseResult(False, usage)
                 if finalized:
                     break
@@ -735,9 +799,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             # would discard any reasoning the proxy received but never cached.
             if not finalized:
                 if self.config.verbose:
-                    log_json(
-                        "model streaming assistant messages", accumulator.messages()
-                    )
+                    log_json("model streaming assistant messages", accumulator.messages())
                 stored = sum(
                     accumulator.store_reasoning(
                         self.reasoning_store,
@@ -787,17 +849,13 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             prefix = b""
             if display_adapter is None:
                 if recovery_notice:
-                    prefix += sse_data(
-                        recovery_notice_chunk(original_model, recovery_notice)
-                    )
+                    prefix += sse_data(recovery_notice_chunk(original_model, recovery_notice))
                 return prefix + b"data: [DONE]\n\n", True, None, None
             closing_chunk = display_adapter.flush_chunk(original_model)
             if closing_chunk is not None:
                 prefix += sse_data(closing_chunk)
             if recovery_notice:
-                prefix += sse_data(
-                    recovery_notice_chunk(original_model, recovery_notice)
-                )
+                prefix += sse_data(recovery_notice_chunk(original_model, recovery_notice))
             return prefix + b"data: [DONE]\n\n", True, None, None
 
         try:
@@ -808,6 +866,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if isinstance(chunk, dict):
             if recovery_notice and inject_recovery_notice(chunk, recovery_notice):
                 recovery_notice = None
+            normalize_upstream_reasoning_fields(chunk)
             accumulator.ingest_chunk(chunk)
             stored = sum(
                 accumulator.store_ready_reasoning(
@@ -829,13 +888,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 chunk["model"] = original_model
             ending = b"\r\n" if line.endswith(b"\r\n") else b"\n"
             return (
-                (
-                    b"data: "
-                    + json.dumps(
-                        chunk, ensure_ascii=False, separators=(",", ":")
-                    ).encode("utf-8")
-                    + ending
-                ),
+                (b"data: " + json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + ending),
                 False,
                 recovery_notice,
                 chunk_usage if isinstance(chunk_usage, dict) else None,
@@ -858,47 +911,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Bind port, default from config or 9000",
     )
     parser.add_argument(
-        "--model",
-        help=(
-            "Fallback DeepSeek model when the request has no model, "
-            "default from config or deepseek-v4-pro"
-        ),
+        "--local",
+        action="store_true",
+        help="Skip Cloudflare tunnel (development and tests only)",
     )
     parser.add_argument(
-        "--base-url",
-        help=("DeepSeek base URL, default from config or https://api.deepseek.com"),
-    )
-    parser.add_argument(
-        "--thinking",
-        choices=["enabled", "disabled"],
-        help="DeepSeek thinking mode, default from config or enabled",
-    )
-    parser.add_argument(
-        "--reasoning-effort",
-        choices=["low", "medium", "high", "max", "xhigh"],
-        help="DeepSeek reasoning effort, default from config or max",
-    )
-    parser.add_argument(
-        "--reasoning-content-path",
-        type=Path,
-        help=(
-            "SQLite reasoning_content cache path, "
-            f"default {default_reasoning_content_path()}"
-        ),
-    )
-    parser.add_argument(
-        "--ngrok",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Start an ngrok tunnel and print the Cursor base URL",
-    )
-    parser.add_argument(
-        "--ngrok-url",
+        "--tunnel-url",
         metavar="URL",
-        help=(
-            "Pass --url=URL to ngrok (reserved endpoint / custom domain); "
-            "see `ngrok http --help`"
-        ),
+        help="Public URL for the tunnel (e.g. https://proxy.yourdomain.com)",
     )
     parser.add_argument(
         "--verbose",
@@ -910,68 +930,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--trace-dir",
         type=Path,
         help="Write full structured request traces to this directory",
-    )
-    parser.add_argument(
-        "--display-reasoning",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Mirror reasoning_content into Cursor-visible content",
-    )
-    parser.add_argument(
-        "--collapsible-reasoning",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Use Markdown details for mirrored reasoning when display is enabled",
-    )
-    parser.add_argument(
-        "--collasible-reasoning",
-        "--collasible-resoning",
-        dest="collapsible_reasoning",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--no-collasible-reasoning",
-        "--no-collasible-resoning",
-        dest="collapsible_reasoning",
-        action="store_false",
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--cors",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Send permissive CORS headers",
-    )
-    parser.add_argument(
-        "--request-timeout",
-        type=float,
-        help="Upstream request timeout in seconds, default from config or 300",
-    )
-    parser.add_argument(
-        "--max-request-body-bytes",
-        type=int,
-        help="Maximum accepted request body size, default from config",
-    )
-    parser.add_argument(
-        "--reasoning-cache-max-age-seconds",
-        type=int,
-        help="Maximum reasoning cache row age in seconds, default from config",
-    )
-    parser.add_argument(
-        "--reasoning-cache-max-rows",
-        type=int,
-        help="Maximum reasoning cache rows, default from config",
-    )
-    parser.add_argument(
-        "--missing-reasoning-strategy",
-        choices=["recover", "reject"],
-        help=(
-            "What to do when required reasoning_content is missing: "
-            "recover (friendly default) or reject (strict debugging mode)"
-        ),
     )
     parser.add_argument(
         "--clear-reasoning-cache",
@@ -986,11 +944,42 @@ def elapsed_ms(started: float) -> int:
 
 
 def log_json(label: str, payload: Any) -> None:
+    sanitized = _sanitize_for_logging(payload)
     LOG.info(
         "%s:\n%s",
         label,
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        json.dumps(sanitized, ensure_ascii=False, indent=2, sort_keys=True),
     )
+
+
+_LOG_FIELD_TRUNCATE_LIMIT = 200
+
+
+def _truncate_for_logging(value: str, limit: int = _LOG_FIELD_TRUNCATE_LIMIT) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "..."
+
+
+def _sanitize_for_logging(obj: Any) -> Any:
+    """Truncate message fields to avoid leaking full conversation to logs."""
+    if isinstance(obj, dict):
+        result: dict[str, Any] = {}
+        for k, v in obj.items():
+            if k in {"content", "reasoning_content", "reasoning"} and isinstance(v, str):
+                result[k] = _truncate_for_logging(v)
+            elif k == "arguments" and isinstance(v, str):
+                result[k] = _truncate_for_logging(v)
+            elif k == "messages" and isinstance(v, list):
+                result[k] = [_sanitize_for_logging(m) for m in v]
+            elif k == "tool_calls" and isinstance(v, list):
+                result[k] = [_sanitize_for_logging(item) for item in v]
+            else:
+                result[k] = _sanitize_for_logging(v)
+        return result
+    if isinstance(obj, list):
+        return [_sanitize_for_logging(item) for item in obj]
+    return obj
 
 
 def log_bytes(label: str, body: bytes) -> None:
@@ -1018,11 +1007,11 @@ def log_cursor_request(
     payload: dict[str, Any],
     config: ProxyConfig,
 ) -> None:
-    model = str(payload.get("model") or config.upstream_model)
+    model = str(payload.get("model") or CURSOR_MODEL_ID)
     LOG.info(
         "┌ request model=%s effort=%s messages=%s",
         model,
-        config.reasoning_effort,
+        REASONING_EFFORT,
         format_count(message_count(payload)),
     )
 
@@ -1035,6 +1024,12 @@ def log_context_summary(prepared: Any) -> None:
             format_count(prepared.patched_reasoning_messages),
         )
         return
+    if prepared.recovered_reasoning_messages:
+        LOG.warning(
+            "reasoning recovery applied: recovered=%s dropped=%s",
+            format_count(prepared.recovered_reasoning_messages),
+            format_count(prepared.recovery_dropped_messages),
+        )
     LOG.info(
         "├ context status=%s missing=%s recovered=%s dropped=%s",
         status,
@@ -1086,11 +1081,7 @@ def user_message_count(payload: dict[str, Any]) -> int:
     messages = payload.get("messages")
     if not isinstance(messages, list):
         return 0
-    return sum(
-        1
-        for message in messages
-        if isinstance(message, dict) and message.get("role") == "user"
-    )
+    return sum(1 for message in messages if isinstance(message, dict) and message.get("role") == "user")
 
 
 def reasoning_content_count(payload: dict[str, Any]) -> int:
@@ -1112,7 +1103,7 @@ def format_usage_count(usage: dict[str, Any] | None, key: str) -> str:
     return format_count(usage.get(key))
 
 
-def reasoning_token_count(usage: dict[str, Any] | None) -> Any:
+def reasoning_token_count(usage: dict[str, Any] | None) -> int | None:
     if not isinstance(usage, dict):
         return None
     details = usage.get("completion_tokens_details")
@@ -1153,11 +1144,7 @@ def int_or_zero(value: Any) -> int:
 
 
 def sse_data(payload: dict[str, Any]) -> bytes:
-    return (
-        b"data: "
-        + json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        + b"\n\n"
-    )
+    return b"data: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
 
 
 def inject_recovery_notice(chunk: dict[str, Any], notice: str) -> bool:
@@ -1173,9 +1160,7 @@ def inject_recovery_notice(chunk: dict[str, Any], notice: str) -> bool:
         if "content" not in delta and not delta.get("tool_calls"):
             continue
         existing_content = delta.get("content")
-        delta["content"] = notice + (
-            existing_content if isinstance(existing_content, str) else ""
-        )
+        delta["content"] = notice + (existing_content if isinstance(existing_content, str) else "")
         return True
     return False
 
@@ -1211,6 +1196,34 @@ def summarize_chat_payload(payload: dict[str, Any]) -> str:
         f"functions={len(functions) if isinstance(functions, list) else 0} "
         f"tool_choice={payload.get('tool_choice')!r}"
     )
+
+
+def _check_json_depth(text: str, max_depth: int = 64) -> None:
+    """Reject JSON bodies that exceed max nesting depth before decoding."""
+    depth = 0
+    max_seen = 0
+    in_string = False
+    escape = False
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in ("{", "["):
+            depth += 1
+            if depth > max_seen:
+                max_seen = depth
+        elif ch in ("}", "]"):
+            depth -= 1
+    if max_seen > max_depth:
+        raise ValueError(f"Request body JSON nesting depth {max_seen} exceeds limit {max_depth}")
 
 
 def read_response_body(response: Any) -> bytes:
@@ -1256,52 +1269,28 @@ def main(argv: list[str] | None = None) -> int:
         updates["host"] = args.host
     if args.port is not None:
         updates["port"] = args.port
-    if args.model is not None:
-        updates["upstream_model"] = args.model
-    if args.base_url is not None:
-        updates["upstream_base_url"] = args.base_url.rstrip("/")
-    if args.thinking is not None:
-        updates["thinking"] = args.thinking
-    if args.reasoning_effort is not None:
-        updates["reasoning_effort"] = args.reasoning_effort
-    if args.reasoning_content_path is not None:
-        updates["reasoning_content_path"] = args.reasoning_content_path
-    if args.ngrok is not None:
-        updates["ngrok"] = args.ngrok
-    if args.ngrok_url is not None:
-        stripped = str(args.ngrok_url).strip()
-        updates["ngrok_url"] = stripped if stripped else None
+    if args.tunnel_url is not None:
+        stripped = str(args.tunnel_url).strip()
+        updates["tunnel_url"] = stripped if stripped else None
     if args.verbose is not None:
         updates["verbose"] = args.verbose
     if args.trace_dir is not None:
         updates["trace_dir"] = args.trace_dir
-    if args.display_reasoning is not None:
-        updates["display_reasoning"] = args.display_reasoning
-    if args.collapsible_reasoning is not None:
-        updates["collapsible_reasoning"] = args.collapsible_reasoning
-    if args.cors is not None:
-        updates["cors"] = args.cors
-    if args.request_timeout is not None:
-        updates["request_timeout"] = args.request_timeout
-    if args.max_request_body_bytes is not None:
-        updates["max_request_body_bytes"] = args.max_request_body_bytes
-    if args.reasoning_cache_max_age_seconds is not None:
-        updates["reasoning_cache_max_age_seconds"] = (
-            args.reasoning_cache_max_age_seconds
-        )
-    if args.reasoning_cache_max_rows is not None:
-        updates["reasoning_cache_max_rows"] = args.reasoning_cache_max_rows
-    if args.missing_reasoning_strategy is not None:
-        updates["missing_reasoning_strategy"] = args.missing_reasoning_strategy
     if updates:
         config = replace(config, **updates)
 
     configure_logging(verbose=config.verbose)
-    warn_if_insecure_upstream(config.upstream_base_url)
+    try:
+        validate_proxy_api_key_hash(config.proxy_api_key_hash)
+    except ValueError as exc:
+        LOG.error("%s", exc)
+        return 2
+    if config.upstream_base_url.rstrip("/") != DEFAULT_UPSTREAM_BASE_URL.rstrip("/"):
+        warn_if_insecure_upstream(config.upstream_base_url)
     store = ReasoningStore(
-        config.reasoning_content_path,
-        max_age_seconds=config.reasoning_cache_max_age_seconds,
-        max_rows=config.reasoning_cache_max_rows,
+        default_reasoning_content_path(),
+        max_age_seconds=DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS,
+        max_rows=DEFAULT_REASONING_CACHE_MAX_ROWS,
     )
     if args.clear_reasoning_cache:
         deleted = store.clear()
@@ -1311,21 +1300,49 @@ def main(argv: list[str] | None = None) -> int:
     trace_writer: TraceWriter | None = None
     if config.trace_dir is not None:
         try:
-            trace_writer = TraceWriter(config.trace_dir)
+            trace_writer = TraceWriter(config.trace_dir, sanitize_trace=True)
         except OSError as exc:
             LOG.error("failed to initialize trace directory: %s", exc)
             store.close()
             return 2
-    server = DeepSeekProxyServer((config.host, config.port), DeepSeekProxyHandler)
+    if not is_loopback_host(config.host):
+        LOG.error(
+            "host=%s must be a loopback address (127.0.0.1, localhost, or ::1)",
+            config.host,
+        )
+        store.close()
+        return 2
+    DeepSeekProxyServer.request_queue_size = DEFAULT_REQUEST_QUEUE_SIZE
+    server = DeepSeekProxyServer(
+        (config.host, config.port),
+        DeepSeekProxyHandler,
+        max_concurrent_requests=DEFAULT_MAX_CONCURRENT_REQUESTS,
+    )
     server.config = config
     server.reasoning_store = store
     server.trace_writer = trace_writer
+    server.tunnel = None
 
-    tunnel: NgrokTunnel | None = None
+    use_tunnel = not args.local
+    tunnel: CloudflareTunnel | None = None
     public_url: str | None = None
-    if config.ngrok:
+    if use_tunnel:
+        if not config.tunnel_url:
+            LOG.error(
+                "tunnel_url is not set; add "
+                "`tunnel_url: https://your-proxy.yourdomain.com` to config.yaml "
+                "(or use --local)"
+            )
+            server.server_close()
+            store.close()
+            return 2
         target_url = local_tunnel_target(config.host, config.port)
-        tunnel = NgrokTunnel(target_url, ngrok_url=config.ngrok_url)
+        tunnel = CloudflareTunnel(
+            target_url,
+            tunnel_name=DEFAULT_TUNNEL_NAME,
+            tunnel_url=config.tunnel_url,
+            probe_public_health=False,
+        )
         try:
             public_url = tunnel.start()
         except RuntimeError as exc:
@@ -1333,39 +1350,43 @@ def main(argv: list[str] | None = None) -> int:
             server.server_close()
             store.close()
             return 2
+        server.tunnel = tunnel
+        LOG.warning(
+            "PUBLIC TUNNEL ACTIVE: %s — only your hashed API key is accepted",
+            config.tunnel_url,
+        )
+    else:
+        LOG.info("local mode: tunnel disabled; Cursor cannot use localhost — " "use for tests and curl only")
     local_base_url = f"http://{config.host}:{config.port}/v1"
-    api_base_url = (
-        f"{public_url.rstrip('/')}/v1" if public_url is not None else local_base_url
-    )
+    api_base_url = f"{public_url.rstrip('/')}/v1" if public_url is not None else local_base_url
 
     LOG.info(
-        "default_model: %s (%s, %s)",
-        config.upstream_model,
-        "thinking" if config.thinking == "enabled" else "no thinking",
-        config.reasoning_effort,
+        "model: %s -> %s (reasoning=%s, recover=always, display=collapsible)",
+        CURSOR_MODEL_ID,
+        OPENROUTER_MODEL_ID,
+        REASONING_EFFORT,
     )
 
     if config.verbose:
-        display_reasoning = "off"
-        if config.display_reasoning:
-            display_reasoning = (
-                "on (collapsible)" if config.collapsible_reasoning else "on"
-            )
-        LOG.info("display_reasoning: %s", display_reasoning)
-        LOG.info("missing_reasoning_strategy: %s", config.missing_reasoning_strategy)
-        LOG.info("reasoning_cache: %s", config.reasoning_content_path)
-        LOG.warning(
-            "verbose logging enabled; prompts and code may be written to stdout"
-        )
+        LOG.info("reasoning_cache: %s", default_reasoning_content_path())
+        LOG.warning("verbose logging enabled; message fields are truncated in stdout logs")
     if trace_writer is not None:
         LOG.info("trace_dir: %s", trace_writer.session_dir)
-        LOG.warning("trace logging enabled; prompts and code will be written to disk")
-    if public_url is None and not config.ngrok:
-        LOG.info("public_tunnel: off")
+        LOG.warning("trace logging enabled; traces store summaries and hashes, not full bodies")
+    if not use_tunnel:
+        LOG.info("public_tunnel: off (local mode)")
     if config.verbose:
         LOG.info("upstream_url: %s/chat/completions", config.upstream_base_url)
     LOG.info("local_base_url: %s", local_base_url)
     LOG.info("api_base_url: %s", api_base_url)
+    if tunnel is not None and tunnel.dead:
+        LOG.error(
+            "tunnel is dead; Cursor cannot reach %s. Restart deepseek-cursor-proxy.",
+            config.tunnel_url,
+        )
+        server.server_close()
+        store.close()
+        return 2
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1374,6 +1395,7 @@ def main(argv: list[str] | None = None) -> int:
         if tunnel is not None:
             tunnel.stop()
         server.server_close()
+        time.sleep(THREAD_DRAIN_SECONDS)
         store.close()
     return 0
 

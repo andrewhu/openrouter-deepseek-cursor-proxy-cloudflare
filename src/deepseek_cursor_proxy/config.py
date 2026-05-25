@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,48 +17,32 @@ MISSING = object()
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9000
-DEFAULT_UPSTREAM_BASE_URL = "https://api.deepseek.com"
-DEFAULT_UPSTREAM_MODEL = "deepseek-v4-pro"
-DEFAULT_THINKING = "enabled"
-DEFAULT_REASONING_EFFORT = "max"
-DEFAULT_DISPLAY_REASONING = True
-DEFAULT_COLLAPSIBLE_REASONING = True
-DEFAULT_NGROK = True
+DEFAULT_UPSTREAM_BASE_URL = "https://openrouter.ai/api/v1"
+CURSOR_MODEL_ID = "deepseek-v4-pro"
+OPENROUTER_MODEL_ID = "deepseek/deepseek-v4-pro"
+OPENROUTER_PROVIDER_ONLY = ["deepseek"]
+REASONING_EFFORT = "xhigh"
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 DEFAULT_VERBOSE = False
 DEFAULT_REQUEST_TIMEOUT = 300.0
 DEFAULT_MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
-DEFAULT_CORS = False
-DEFAULT_MISSING_REASONING_STRATEGY = "recover"
+DEFAULT_REQUEST_QUEUE_SIZE = 128
+DEFAULT_MAX_CONCURRENT_REQUESTS = 32
+DEFAULT_TUNNEL_NAME = "deepseek-proxy"
 DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_REASONING_CACHE_MAX_ROWS = 100_000
 
-DEFAULT_CONFIG_HEADER = (
-    "# This file was created automatically at ~/.deepseek-cursor-proxy/config.yaml."
-)
+DEFAULT_CONFIG_HEADER = "# This file was created automatically at ~/.deepseek-cursor-proxy/config.yaml."
 DEFAULT_CONFIG_TEXT = f"""{DEFAULT_CONFIG_HEADER}
-# API keys are read from Cursor's Authorization header and forwarded upstream.
+# Cursor sends your OpenRouter API key as Bearer; the proxy checks it against proxy_api_key_hash.
+# Upstream is always OpenRouter DeepSeek V4 Pro (model id {CURSOR_MODEL_ID} in Cursor).
 
-# `model` is the fallback when a request has no model; Cursor's requested
-# DeepSeek model name is otherwise respected.
-base_url: {DEFAULT_UPSTREAM_BASE_URL}
-model: {DEFAULT_UPSTREAM_MODEL}
-thinking: {DEFAULT_THINKING}
-reasoning_effort: {DEFAULT_REASONING_EFFORT}
-display_reasoning: {str(DEFAULT_DISPLAY_REASONING).lower()}
-collasible_reasoning: {str(DEFAULT_COLLAPSIBLE_REASONING).lower()}
+proxy_api_key_hash: "<sha256-of-your-openrouter-api-key>"
+tunnel_url: https://proxy.yourdomain.com
 
 host: {DEFAULT_HOST}
 port: {DEFAULT_PORT}
-ngrok: {str(DEFAULT_NGROK).lower()}
 verbose: {str(DEFAULT_VERBOSE).lower()}
-request_timeout: {DEFAULT_REQUEST_TIMEOUT:g}
-max_request_body_bytes: {DEFAULT_MAX_REQUEST_BODY_BYTES}
-cors: {str(DEFAULT_CORS).lower()}
-
-reasoning_content_path: {REASONING_CONTENT_FILE_NAME}
-missing_reasoning_strategy: {DEFAULT_MISSING_REASONING_STRATEGY}
-reasoning_cache_max_age_seconds: {DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS}
-reasoning_cache_max_rows: {DEFAULT_REASONING_CACHE_MAX_ROWS}
 """
 
 
@@ -105,14 +89,6 @@ def setting_value(settings: Mapping[str, Any], key: str) -> Any:
     return settings.get(key, MISSING)
 
 
-def setting_value_any(settings: Mapping[str, Any], *keys: str) -> Any:
-    for key in keys:
-        value = setting_value(settings, key)
-        if value is not MISSING:
-            return value
-    return MISSING
-
-
 def as_str(value: Any, default: str) -> str:
     if value is MISSING or value is None:
         return default
@@ -150,45 +126,20 @@ def as_int(value: Any, default: int) -> int:
         return default
 
 
-def as_float(value: Any, default: float) -> float:
-    if value is MISSING or value is None:
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+def is_openrouter_upstream(base_url: str) -> bool:
+    return "openrouter.ai" in base_url
 
 
-def as_path(value: Any, default_path: Path, relative_base: Path) -> Path:
-    if value is MISSING or value is None or value == "":
-        return default_path
-    candidate_path = Path(str(value)).expanduser()
-    if candidate_path.is_absolute():
-        return candidate_path
-    return relative_base / candidate_path
+def is_loopback_host(host: str) -> bool:
+    return host.strip().lower() in LOOPBACK_HOSTS
 
 
-def settings_from_config(
-    config_path: str | Path | None,
-) -> tuple[dict[str, Any], Path]:
-    resolved_config_path = resolve_config_path(config_path)
-    if config_path is None and not resolved_config_path.exists():
-        populate_default_config_file(resolved_config_path)
-    return load_config_file(resolved_config_path), resolved_config_path
-
-
-def normalize_thinking(value: Any) -> str:
-    thinking = as_str(value, DEFAULT_THINKING).strip().lower()
-    if thinking in {"enabled", "disabled"}:
-        return thinking
-    return DEFAULT_THINKING
-
-
-def normalize_missing_reasoning_strategy(value: Any) -> str:
-    strategy = as_str(value, DEFAULT_MISSING_REASONING_STRATEGY).strip().lower()
-    if strategy in {"recover", "reject"}:
-        return strategy
-    return DEFAULT_MISSING_REASONING_STRATEGY
+def validate_proxy_api_key_hash(value: str | None) -> None:
+    if value is None:
+        raise ValueError("proxy_api_key_hash is required")
+    normalized = value.strip().lower()
+    if len(normalized) != 64 or not all(character in "0123456789abcdef" for character in normalized):
+        raise ValueError("proxy_api_key_hash must be a 64-character lowercase hex SHA-256 digest")
 
 
 @dataclass(frozen=True)
@@ -196,21 +147,9 @@ class ProxyConfig:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     upstream_base_url: str = DEFAULT_UPSTREAM_BASE_URL
-    upstream_model: str = DEFAULT_UPSTREAM_MODEL
-    thinking: str = DEFAULT_THINKING
-    reasoning_effort: str = DEFAULT_REASONING_EFFORT
-    request_timeout: float = DEFAULT_REQUEST_TIMEOUT
-    max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
-    reasoning_content_path: Path = field(default_factory=default_reasoning_content_path)
-    missing_reasoning_strategy: str = DEFAULT_MISSING_REASONING_STRATEGY
-    reasoning_cache_max_age_seconds: int = DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS
-    reasoning_cache_max_rows: int = DEFAULT_REASONING_CACHE_MAX_ROWS
-    display_reasoning: bool = DEFAULT_DISPLAY_REASONING
-    collapsible_reasoning: bool = DEFAULT_COLLAPSIBLE_REASONING
-    cors: bool = DEFAULT_CORS
+    proxy_api_key_hash: str | None = None
     verbose: bool = DEFAULT_VERBOSE
-    ngrok: bool = DEFAULT_NGROK
-    ngrok_url: str | None = None
+    tunnel_url: str | None = None
     trace_dir: Path | None = None
 
     @classmethod
@@ -218,8 +157,10 @@ class ProxyConfig:
         cls: type[ProxyConfig],
         config_path: str | Path | None = None,
     ) -> "ProxyConfig":
-        settings, resolved_config_path = settings_from_config(config_path)
-        config_dir = resolved_config_path.parent
+        settings, _resolved_config_path = settings_from_config(config_path)
+        proxy_api_key_hash = as_optional_str(setting_value(settings, "proxy_api_key_hash"))
+        if proxy_api_key_hash is not None:
+            proxy_api_key_hash = proxy_api_key_hash.lower()
 
         return cls(
             host=as_str(
@@ -230,66 +171,19 @@ class ProxyConfig:
                 setting_value(settings, "port"),
                 DEFAULT_PORT,
             ),
-            upstream_base_url=as_str(
-                setting_value(settings, "base_url"),
-                DEFAULT_UPSTREAM_BASE_URL,
-            ).rstrip("/"),
-            upstream_model=as_str(
-                setting_value(settings, "model"),
-                DEFAULT_UPSTREAM_MODEL,
-            ),
-            thinking=normalize_thinking(setting_value(settings, "thinking")),
-            reasoning_effort=as_str(
-                setting_value(settings, "reasoning_effort"),
-                DEFAULT_REASONING_EFFORT,
-            ),
-            request_timeout=as_float(
-                setting_value(settings, "request_timeout"),
-                DEFAULT_REQUEST_TIMEOUT,
-            ),
-            max_request_body_bytes=as_int(
-                setting_value(settings, "max_request_body_bytes"),
-                DEFAULT_MAX_REQUEST_BODY_BYTES,
-            ),
-            reasoning_content_path=as_path(
-                setting_value(settings, "reasoning_content_path"),
-                default_reasoning_content_path(),
-                config_dir,
-            ),
-            missing_reasoning_strategy=normalize_missing_reasoning_strategy(
-                setting_value(settings, "missing_reasoning_strategy")
-            ),
-            reasoning_cache_max_age_seconds=as_int(
-                setting_value(settings, "reasoning_cache_max_age_seconds"),
-                DEFAULT_REASONING_CACHE_MAX_AGE_SECONDS,
-            ),
-            reasoning_cache_max_rows=as_int(
-                setting_value(settings, "reasoning_cache_max_rows"),
-                DEFAULT_REASONING_CACHE_MAX_ROWS,
-            ),
-            display_reasoning=as_bool(
-                setting_value(settings, "display_reasoning"),
-                DEFAULT_DISPLAY_REASONING,
-            ),
-            collapsible_reasoning=as_bool(
-                setting_value_any(
-                    settings,
-                    "collasible_reasoning",
-                    "collapsible_reasoning",
-                ),
-                DEFAULT_COLLAPSIBLE_REASONING,
-            ),
-            cors=as_bool(
-                setting_value(settings, "cors"),
-                DEFAULT_CORS,
-            ),
+            proxy_api_key_hash=proxy_api_key_hash,
             verbose=as_bool(
                 setting_value(settings, "verbose"),
                 DEFAULT_VERBOSE,
             ),
-            ngrok=as_bool(
-                setting_value(settings, "ngrok"),
-                DEFAULT_NGROK,
-            ),
-            ngrok_url=as_optional_str(setting_value(settings, "ngrok_url")),
+            tunnel_url=as_optional_str(setting_value(settings, "tunnel_url")),
         )
+
+
+def settings_from_config(
+    config_path: str | Path | None,
+) -> tuple[dict[str, Any], Path]:
+    resolved_config_path = resolve_config_path(config_path)
+    if config_path is None and not resolved_config_path.exists():
+        populate_default_config_file(resolved_config_path)
+    return load_config_file(resolved_config_path), resolved_config_path

@@ -8,19 +8,15 @@ import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from deepseek_cursor_proxy.config import ProxyConfig
+from deepseek_cursor_proxy.config import OPENROUTER_MODEL_ID, ProxyConfig
 from deepseek_cursor_proxy.reasoning_store import ReasoningStore
 from deepseek_cursor_proxy.server import DeepSeekProxyHandler, DeepSeekProxyServer
 
 
-LIVE_DEEPSEEK = os.getenv("RUN_LIVE_DEEPSEEK_TESTS") == "1" and bool(
-    os.getenv("LIVE_DEEPSEEK_KEY")
-)
+LIVE_OPENROUTER = os.getenv("RUN_LIVE_OPENROUTER_TESTS") == "1" and bool(os.getenv("LIVE_OPENROUTER_KEY"))
 
 
-def post_json(
-    url: str, payload: dict, api_key: str, timeout: int = 180
-) -> tuple[int, dict]:
+def post_json(url: str, payload: dict, api_key: str, timeout: int = 180) -> tuple[int, dict]:
     request = Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -43,9 +39,7 @@ class ProxyFixture:
         self.store = ReasoningStore(":memory:")
         server = DeepSeekProxyServer(("127.0.0.1", 0), DeepSeekProxyHandler)
         server.config = ProxyConfig(
-            upstream_base_url="https://api.deepseek.com",
-            upstream_model="deepseek-v4-pro",
-            request_timeout=180,
+            upstream_base_url="https://openrouter.ai/api/v1",
         )
         server.reasoning_store = self.store
         self.server = server
@@ -68,12 +62,12 @@ class ProxyFixture:
 
 
 @unittest.skipUnless(
-    LIVE_DEEPSEEK,
-    "set RUN_LIVE_DEEPSEEK_TESTS=1 and LIVE_DEEPSEEK_KEY to run live tests",
+    LIVE_OPENROUTER,
+    "set RUN_LIVE_OPENROUTER_TESTS=1 and LIVE_OPENROUTER_KEY to run live tests",
 )
-class LiveDeepSeekProxyTests(unittest.TestCase):
-    def test_proxy_repairs_real_deepseek_tool_call_history(self) -> None:
-        api_key = os.environ["LIVE_DEEPSEEK_KEY"]
+class LiveOpenRouterProxyTests(unittest.TestCase):
+    def test_proxy_repairs_real_openrouter_tool_call_history(self) -> None:
+        api_key = os.environ["LIVE_OPENROUTER_KEY"]
         proxy = ProxyFixture().start()
         try:
             first_status, first_response = post_json(
@@ -83,11 +77,14 @@ class LiveDeepSeekProxyTests(unittest.TestCase):
             )
             self.assertEqual(first_status, 200, first_response.get("error"))
             assistant_with_reasoning = first_response["choices"][0]["message"]
-            self.assertTrue(assistant_with_reasoning.get("reasoning_content"))
+            self.assertTrue(
+                assistant_with_reasoning.get("reasoning_content") or assistant_with_reasoning.get("reasoning")
+            )
             self.assertTrue(assistant_with_reasoning.get("tool_calls"))
 
             cursor_assistant = deepcopy(assistant_with_reasoning)
             cursor_assistant.pop("reasoning_content", None)
+            cursor_assistant.pop("reasoning", None)
             tool_messages = [
                 {
                     "role": "tool",
@@ -104,17 +101,26 @@ class LiveDeepSeekProxyTests(unittest.TestCase):
                     *tool_messages,
                 ],
                 "tools": first_request()["tools"],
-                "thinking": {"type": "enabled"},
-                "reasoning_effort": "high",
             }
 
             direct_status, direct_response = post_json(
-                "https://api.deepseek.com/chat/completions",
-                missing_reasoning_payload,
+                "https://openrouter.ai/api/v1/chat/completions",
+                {
+                    **missing_reasoning_payload,
+                    "model": OPENROUTER_MODEL_ID,
+                    "reasoning": {"effort": "xhigh"},
+                    "provider": {
+                        "only": ["deepseek"],
+                        "allow_fallbacks": False,
+                    },
+                },
                 api_key=api_key,
             )
             self.assertEqual(direct_status, 400)
-            self.assertIn("reasoning_content", direct_response["error"]["message"])
+            self.assertIn(
+                "reasoning",
+                direct_response.get("error", {}).get("message", "").lower(),
+            )
 
             proxy_status, second_response = post_json(
                 proxy.url,
@@ -123,13 +129,12 @@ class LiveDeepSeekProxyTests(unittest.TestCase):
             )
             self.assertEqual(proxy_status, 200, second_response.get("error"))
             final_assistant = second_response["choices"][0]["message"]
-            self.assertTrue(
-                final_assistant.get("content") or final_assistant.get("tool_calls")
-            )
+            self.assertTrue(final_assistant.get("content") or final_assistant.get("tool_calls"))
 
             if final_assistant.get("content"):
                 cursor_final = deepcopy(final_assistant)
                 cursor_final.pop("reasoning_content", None)
+                cursor_final.pop("reasoning", None)
                 followup_payload = {
                     "model": "deepseek-v4-pro",
                     "messages": [
@@ -140,8 +145,6 @@ class LiveDeepSeekProxyTests(unittest.TestCase):
                         {"role": "user", "content": "Reply with exactly: OK"},
                     ],
                     "tools": first_request()["tools"],
-                    "thinking": {"type": "enabled"},
-                    "reasoning_effort": "high",
                 }
                 followup_status, followup_response = post_json(
                     proxy.url,

@@ -1,0 +1,11 @@
+# Copy to ~/.deepseek-cursor-proxy/config.yaml (created automatically on first run).
+# Do NOT put your OpenRouter API key here — only its SHA-256 hash.
+# Cursor sends your OpenRouter API key as Bearer; the proxy checks it against proxy_api_key_hash.
+# Upstream is always OpenRouter DeepSeek V4 Pro (model id deepseek-v4-pro in Cursor).
+
+proxy_api_key_hash: "<sha256-of-your-openrouter-api-key>"
+tunnel_url: https://proxy.yourdomain.com
+
+host: 127.0.0.1
+port: 9000
+verbose: false

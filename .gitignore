@@ -139,10 +139,15 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
 .envrc
 .deepseek_cursor_reasoning.sqlite3*
 .deepseek-cursor/
 .deepseek-cursor-proxy/
+# Repo-local config overrides (use config.example.yaml as template)
+config.yaml
+dev.config.yaml
+*.local.yaml
 trace-dumps/
 reasoning_content.sqlite3*
 .venv
@@ -203,10 +208,7 @@ cython_debug/
 .pypirc
 
 # Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
+#  `.cursorindexingignore` is user-specific; `.cursorignore` is committed for shared secret exclusions.
 .cursorindexingignore
 
 # Marimo

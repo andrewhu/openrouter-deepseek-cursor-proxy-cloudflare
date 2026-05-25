@@ -27,8 +27,10 @@ classifiers = [
 ]
 dependencies = [
     "PyYAML>=6.0",
+    "urllib3>=2.7.0",
 ]
 
+# Keep the setuptools extra for users who install with pip/venv tooling.
 [project.optional-dependencies]
 dev = [
     "black==24.2.0",
@@ -47,4 +49,17 @@ where = ["src"]
 include = ["deepseek_cursor_proxy*"]
 
 [tool.black]
+line-length = 120
 target-version = ["py310"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.pylint.format]
+max-line-length = 120
+
+# Keep uv's PEP 735 dev group for local test dependencies.
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

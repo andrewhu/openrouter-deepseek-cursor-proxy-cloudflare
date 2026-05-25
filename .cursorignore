@@ -1,0 +1,11 @@
+# Keep secrets and local runtime data out of Cursor AI context.
+# See https://docs.cursor.com/context/ignore-files
+
+.env
+.env.*
+config.yaml
+dev.config.yaml
+*.local.yaml
+.deepseek-cursor-proxy/
+trace-dumps/
+reasoning_content.sqlite3*
